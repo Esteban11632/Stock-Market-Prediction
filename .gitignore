@@ -3,3 +3,6 @@
 
 # Python bytecode cache
 __pycache__/
+
+# Scalers files
+*.joblib
