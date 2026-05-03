@@ -35,7 +35,7 @@ def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_retu
 
     # Align rows with test_loader order: sample j corresponds to dataset index test_indices[j].
     for j, k in enumerate(test_indices):
-        p = k + seq_length
+        p = k + full_ds._warmup + seq_length
         prev_c = float(close.loc[r.index[p - 1]])
         pred_prices.append(prev_c * (1.0 + float(pred_ret_flat[j])))
         actual_prices.append(float(close.loc[r.index[p]]))
@@ -47,32 +47,54 @@ def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_retu
 
     return pred_prices, actual_prices, test_dates
 
-def recursive_forecast(model, df, full_ds, seq_length, scaler_X, scaler_y, device, horizon, nf, pred_prices, test_dates, actual_prices):
+def recursive_forecast(
+    model,
+    df,
+    full_ds,
+    seq_length,
+    scaler_X,
+    scaler_y,
+    device,
+    horizon,
+    nf_in,
+    pred_prices,
+    test_dates,
+    actual_prices,
+    nf_out=None,
+):
+    if nf_out is None:
+        nf_out = nf_in
     last_idx = len(full_ds) - 1
     window = full_ds[last_idx][0].numpy().copy()
     close = get_column_normalized_to_1d(df, "Close")
     r = full_ds.returns
-    price_curr = float(close.loc[r.index[last_idx + seq_length]])
+    anchor_i = last_idx + full_ds._warmup + seq_length - 1
+    forecast_i = last_idx + full_ds._warmup + seq_length
+    price_curr = float(close.loc[r.index[anchor_i]])
     recursive_prices = [price_curr]
     recursive_returns = []
     model.eval()
     with torch.inference_mode():
         for _ in range(horizon):
-            flat = window.reshape(-1, nf)
-            X_scaled = scaler_X.transform(flat).reshape(seq_length, nf).astype(np.float32)
+            flat = window.reshape(-1, nf_in)
+            X_scaled = scaler_X.transform(flat).reshape(seq_length, nf_in).astype(np.float32)
             xb = torch.tensor(X_scaled, device=device).unsqueeze(0)
             pred_scaled = model(xb)
-            y_pred = scaler_y.inverse_transform(pred_scaled.cpu().numpy())[0]
+            y_pred = scaler_y.inverse_transform(pred_scaled.cpu().numpy())[0].reshape(-1)
             r_pred = float(y_pred[0])
             recursive_returns.append(r_pred)
             price_curr = price_curr * (1.0 + r_pred)
             recursive_prices.append(price_curr)
             window = np.roll(window, -1, axis=0)
-            window[-1] = y_pred
+            y_full = np.zeros(nf_in, dtype=np.float64)
+            y_full[: min(nf_out, len(y_pred))] = y_pred[:nf_out]
+            if nf_out < nf_in:
+                y_full[nf_out:] = window[-2, nf_out:nf_in]
+            window[-1] = y_full
 
     recursive_prices = np.array(recursive_prices, dtype=np.float64)
     print(
-        f"Recursive {horizon}-day forecast (closes from last bar {r.index[last_idx + seq_length]}): "
+        f"Recursive {horizon}-day forecast (anchor close {r.index[anchor_i]}; next bar {r.index[forecast_i]}): "
         f"{recursive_prices.round(4)}"
     )
 

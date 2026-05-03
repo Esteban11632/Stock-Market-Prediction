@@ -6,3 +6,12 @@ __pycache__/
 
 # Scalers files
 *.joblib
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.synctex(busy)

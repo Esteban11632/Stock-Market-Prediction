@@ -3,7 +3,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import root_mean_squared_error
 import torch
 import torch.optim as optim
-from model import StockMarketModel
+from cnn_lstm_attention import ConvLSTMAttentionStockModel
+from transformer import StockTransformer
 from tqdm import tqdm
 from pathlib import Path
 from data_pipeline import StockMarketDataset, split_data
@@ -14,11 +15,11 @@ from joblib import dump
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-ticker = "MSFT"
+ticker = "VOO"
 
 df = yf.download(ticker, start="2000-01-01")
 
-seq_length = 30
+seq_length = 10
 
 full_ds = StockMarketDataset(df, seq_length)
 X_train, X_val, X_test, y_train, y_val, y_test = split_data(full_ds)
@@ -30,14 +31,14 @@ test_indices = list(range(start_test, start_test + len(X_test)))
 scaler_X = StandardScaler()
 scaler_y = StandardScaler()
 
-# Last dimension is the number of features
-nf = X_train.shape[-1]
+nf_in = X_train.shape[-1]
+nf_out = y_train.shape[-1]
 
-# Reshape to (N, nf) for scaling
-scaler_X.fit(X_train.reshape(-1, nf))
-X_train_scaled = scaler_X.transform(X_train.reshape(-1, nf)).reshape(X_train.shape)
-X_val_scaled = scaler_X.transform(X_val.reshape(-1, nf)).reshape(X_val.shape)
-X_test_scaled = scaler_X.transform(X_test.reshape(-1, nf)).reshape(X_test.shape)
+# Reshape to (N, nf_in) for scaling
+scaler_X.fit(X_train.reshape(-1, nf_in))
+X_train_scaled = scaler_X.transform(X_train.reshape(-1, nf_in)).reshape(X_train.shape)
+X_val_scaled = scaler_X.transform(X_val.reshape(-1, nf_in)).reshape(X_val.shape)
+X_test_scaled = scaler_X.transform(X_test.reshape(-1, nf_in)).reshape(X_test.shape)
 
 # Fit scaler on training targets
 scaler_y.fit(y_train)
@@ -84,13 +85,14 @@ def mse_mean_over_batches(loader, model, criterion, device, out_dim):
             n_elem += batch_elems
     return total / max(n_elem, 1)
 
-model = StockMarketModel(
-    input_dim=nf, hidden_dim=16, num_layers=1, output_dim=nf, dropout=0.35
+model = ConvLSTMAttentionStockModel(
+    input_dim=nf_in,
+    output_dim=nf_out
 ).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
 
-num_epochs = 130
+num_epochs = 190
 patience = 60
 best_val = float("inf")
 epochs_no_improve = 0
@@ -107,13 +109,13 @@ for epoch in tqdm(range(num_epochs)):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        batch_elems = X_batch.size(0) * nf
+        batch_elems = X_batch.size(0) * nf_out
         train_loss_sum += loss.item() * batch_elems
         n_elem_train += batch_elems
     train_loss = train_loss_sum / max(n_elem_train, 1)
 
     model.eval()
-    val_loss = mse_mean_over_batches(val_loader, model, criterion, device, nf)
+    val_loss = mse_mean_over_batches(val_loader, model, criterion, device, nf_out)
 
     if val_loss < best_val:
         best_val = val_loss
@@ -149,8 +151,8 @@ train_rmse = root_mean_squared_error(y_train_inv, y_train_preds)
 test_rmse = root_mean_squared_error(y_test_inv, y_test_preds)
 
 print(
-    f"Train RMSE (avg over 5 targets): {train_rmse:.6f} | "
-    f"Test RMSE (avg over 5 targets): {test_rmse:.6f}"
+    f"Train RMSE (avg over {nf_out} targets): {train_rmse:.6f} | "
+    f"Test RMSE (avg over {nf_out} targets): {test_rmse:.6f}"
 )
 
 # Save the model and scalers
@@ -159,6 +161,6 @@ model_dir = directory / "models"
 scaler_dir = directory / "scalers"
 model_dir.mkdir(parents=True, exist_ok=True)
 scaler_dir.mkdir(parents=True, exist_ok=True)
-torch.save(model.state_dict(), model_dir / "stock_market_model_all_columns.pth")
-dump(scaler_X, scaler_dir / "scaler_X_all_columns.joblib")
-dump(scaler_y, scaler_dir / "scaler_y_all_columns.joblib")
+torch.save(model.state_dict(), model_dir / "stock_market_model.pth")
+dump(scaler_X, scaler_dir / "scaler_X.joblib")
+dump(scaler_y, scaler_dir / "scaler_y.joblib")
