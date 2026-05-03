@@ -3,15 +3,14 @@ from pathlib import Path
 import yfinance as yf
 from torch.utils.data import DataLoader, TensorDataset
 from joblib import load
-
-from lstm import StockMarketModel
+from cnn_lstm_attention import ConvLSTMAttentionStockModel
 from data_pipeline import StockMarketDataset
 import utils
 
-ticker = "MSFT"
+ticker = "VOO"
 seq_length = 10
 
-df = yf.download(ticker, start="2020-01-01")
+df = yf.download(ticker, start="2024-01-01")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 directory = Path(__file__).resolve().parent.parent
@@ -42,12 +41,9 @@ test_loader = DataLoader(
     shuffle=False,
 )
 
-model = StockMarketModel(
+model = ConvLSTMAttentionStockModel(
     input_dim=nf_in,
-    hidden_dim=16,
-    num_layers=1,
     output_dim=nf_out,
-    dropout=0.35,
 ).to(device)
 state = torch.load(models_dir / filename, map_location=device)
 model.load_state_dict(state)

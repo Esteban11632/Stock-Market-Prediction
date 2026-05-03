@@ -62,16 +62,38 @@ class StockMarketDataset(Dataset):
             self.close_pos,
         ]
 
+        # Moving averages
         self.ma_windows = (5, 10, 20)
         self._warmup = max(self.ma_windows) - 1
-        self.moving_average_5 = self.get_moving_average(5, self.returns)
-        self.moving_average_10 = self.get_moving_average(10, self.returns)
-        self.moving_average_20 = self.get_moving_average(20, self.returns)
+        # Closing-price SMA (textbook Ma_N = mean of last N closes); aligned to idx like other cols_y
+        self.moving_average_5 = self.get_moving_average(5, close).reindex(idx)
+        self.moving_average_10 = self.get_moving_average(10, close).reindex(idx)
+        self.moving_average_20 = self.get_moving_average(20, close).reindex(idx)
 
+        # Rolling volatility
+        self.rolling_volatility_5 = self.returns.rolling(window=5, min_periods=5).std()
+        self.rolling_volatility_10 = self.returns.rolling(window=10, min_periods=10).std()
+
+        # Bollinger Bands on close (20, ±2σ); align to idx for iloc stacking
+        bb_mid = close.rolling(window=20, min_periods=20).mean()
+        bb_std = close.rolling(window=20, min_periods=20).std()
+        self.bollinger_bands_20 = bb_mid.reindex(idx)
+        self.bollinger_bands_20_std = bb_std.reindex(idx)
+        self.bollinger_bands_20_upper = (
+            self.bollinger_bands_20 + 2 * self.bollinger_bands_20_std
+        )
+        self.bollinger_bands_20_lower = (
+            self.bollinger_bands_20 - 2 * self.bollinger_bands_20_std
+        )
         self.cols_x = list(self.cols_y) + [
             self.moving_average_5,
             self.moving_average_10,
             self.moving_average_20,
+            self.rolling_volatility_5,
+            self.rolling_volatility_10,
+            self.bollinger_bands_20,
+            self.bollinger_bands_20_upper,
+            self.bollinger_bands_20_lower
         ]
 
     @property

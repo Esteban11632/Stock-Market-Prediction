@@ -57,13 +57,13 @@ class ConvLSTMAttentionStockModel(nn.Module):
             hidden_size=lstm_hidden,
             num_layers=num_lstm_layers,
             batch_first=True,
-            dropout=lstm_dropout,
+            dropout=lstm_dropout
         )
         self.attn = AdditiveAttentionPooling(lstm_hidden)
         self.head = nn.Sequential(
             nn.Linear(lstm_hidden, head_hidden),
             nn.ReLU(),
-            nn.Linear(head_hidden, output_dim),
+            nn.Linear(head_hidden, output_dim)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

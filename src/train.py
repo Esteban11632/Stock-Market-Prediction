@@ -17,7 +17,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ticker = "VOO"
 
-df = yf.download(ticker, start="2000-01-01")
+df = yf.download(ticker, start="2000-01-01", end="2023-12-31")
 
 seq_length = 10
 
