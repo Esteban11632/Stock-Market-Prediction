@@ -12,6 +12,7 @@ from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import utils
 from joblib import dump
+from features import features
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -146,14 +147,24 @@ y_train_inv = scaler_y.inverse_transform(y_train_scaled.numpy())
 y_test_preds = scaler_y.inverse_transform(y_test_pred.numpy())
 y_test_inv = scaler_y.inverse_transform(y_test_scaled.numpy())
 
-# Multi-output (5 targets); sklearn averages RMSE across outputs by default.
+# Multi-output; sklearn averages RMSE across outputs by default (see multioutput='uniform_average').
 train_rmse = root_mean_squared_error(y_train_inv, y_train_preds)
 test_rmse = root_mean_squared_error(y_test_inv, y_test_preds)
+
+# Column 0 = daily return (first entry in StockMarketDataset.cols_y).
+_ret = 0
+train_rmse_ret = root_mean_squared_error(y_train_inv[:, _ret], y_train_preds[:, _ret])
+test_rmse_ret = root_mean_squared_error(y_test_inv[:, _ret], y_test_preds[:, _ret])
 
 print(
     f"Train RMSE (avg over {nf_out} targets): {train_rmse:.6f} | "
     f"Test RMSE (avg over {nf_out} targets): {test_rmse:.6f}"
 )
+print(f"Train RMSE (daily return): {train_rmse_ret:.6f} | Test RMSE (daily return): {test_rmse_ret:.6f}")
+
+feature_importance = utils.permutation_feature_importance_mse(model, X_test_scaled, y_test_scaled, device, feature_names=features)
+print(feature_importance)
+utils.plot_permutation_feature_importance(feature_importance)
 
 # Save the model and scalers
 directory = Path(__file__).resolve().parent.parent

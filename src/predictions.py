@@ -1,5 +1,6 @@
 import torch
 from pathlib import Path
+from sklearn.metrics import root_mean_squared_error
 import yfinance as yf
 from torch.utils.data import DataLoader, TensorDataset
 from joblib import load
@@ -51,6 +52,9 @@ model.load_state_dict(state)
 y_pred_scaled, y_true_scaled = utils.predict_loader(model, test_loader, device)
 y_pred = scaler_y.inverse_transform(y_pred_scaled.numpy())
 y_true = scaler_y.inverse_transform(y_true_scaled.numpy())
+# Column 0 = daily return (StockMarketDataset.cols_y[0]).
+_rmse_ret = root_mean_squared_error(y_true[:, 0], y_pred[:, 0])
+print(f"RMSE (daily return): {_rmse_ret:.6f}")
 indices = list(range(0, len(X_scaled)))
 pred_prices, actual_prices, test_dates = utils.predicted_returns_to_prices(df, full_ds, indices, seq_length, y_pred)
 horizon = 5

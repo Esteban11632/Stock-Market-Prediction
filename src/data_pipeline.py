@@ -3,7 +3,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-
 class StockMarketDataset(Dataset):
     """Sliding windows: X[t] stacks input channels; y is next-bar targets only.
 
@@ -57,7 +56,7 @@ class StockMarketDataset(Dataset):
         self.cols_y = [
             self.returns,
             self.body,
-            self.range,
+            #self.range,
             self.vol_chg,
             self.close_pos,
         ]

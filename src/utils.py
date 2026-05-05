@@ -21,7 +21,111 @@ def predict_loader(model, loader, device):
             ys.append(yb)
     return torch.cat(preds, dim=0), torch.cat(ys, dim=0)
 
-def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_returns):
+
+def predict_numpy_batches(model, X_np, device, batch_size=512):
+    """Run inference on `(N, T, F)` float array; returns `(N, n_out)` on CPU numpy."""
+    model.eval()
+    n = len(X_np)
+    X_t = torch.from_numpy(X_np.astype(np.float32, copy=False))
+    outs = []
+    with torch.inference_mode():
+        for start in range(0, n, batch_size):
+            xb = X_t[start : start + batch_size].to(device)
+            outs.append(model(xb).cpu().numpy())
+    return np.concatenate(outs, axis=0)
+
+
+def permutation_feature_importance_mse(
+    model,
+    X_np,
+    y_np,
+    device,
+    feature_names=None,
+    batch_size=512,
+    seed=0,
+):
+    """Shuffle one input channel across samples (break alignment with targets), measure MSE change.
+
+    `X_np`/`y_np` must be on the **same scale the model sees** (e.g. scaler output). MSE matches
+    `np.mean((pred - y)**2)` over **all outputs and samples** — same normalization as averaging
+    `nn.MSELoss()` over disjoint batches whose total size is `(N * n_outputs)`.
+
+    For each feature index ``i``, sets ``Xp[:, :, i] = X[perm, :, i]`` where ``perm`` is a random
+    permutation of batch indices — the usual permutation-importance analogue for tensors shaped
+    ``(samples, seq_len, channels)``.
+    """
+    if isinstance(X_np, torch.Tensor):
+        X_np = X_np.detach().cpu().numpy()
+    else:
+        X_np = np.asarray(X_np)
+
+    if isinstance(y_np, torch.Tensor):
+        y_np = y_np.detach().cpu().numpy()
+    else:
+        y_np = np.asarray(y_np)
+
+    rng = np.random.default_rng(seed)
+    n, _, nfeat = X_np.shape
+
+    names = (
+        feature_names
+        if feature_names is not None
+        else [f"f{i}" for i in range(nfeat)]
+    )
+    if len(names) != nfeat:
+        raise ValueError(f"Got {len(names)} names but X has {nfeat} channels")
+
+    pred0 = predict_numpy_batches(model, X_np, device, batch_size=batch_size)
+    base_mse = np.mean((pred0 - y_np) ** 2)
+
+    deltas = []
+    for i in range(nfeat):
+        Xp = X_np.copy()
+        perm = rng.permutation(n)
+        Xp[:, :, i] = X_np[perm, :, i]
+        pred = predict_numpy_batches(model, Xp, device, batch_size=batch_size)
+        deltas.append(np.mean((pred - y_np) ** 2) - base_mse)
+
+    return pd.DataFrame({"Feature": names, "mse_increase": deltas}).sort_values(
+        "mse_increase", ascending=False
+    )
+
+
+def plot_permutation_feature_importance(
+    importance_df,
+    *,
+    value_col="mse_increase",
+    feature_col="Feature",
+    title="Feature Importance (Permutation Method)",
+    xlabel="Increase in MSE After Feature Permutation",
+    show=True,
+):
+    """Horizontal bar chart of permutation ΔMSE (dark theme, strongest feature at top)."""
+    df_plot = importance_df.sort_values(value_col, ascending=True)
+
+    h = max(6.0, 0.35 * len(df_plot))
+    fig, ax = plt.subplots(figsize=(10, h), facecolor="black")
+    ax.set_facecolor("black")
+
+    y_labels = df_plot[feature_col].astype(str)
+    values = df_plot[value_col].to_numpy()
+
+    ax.barh(y_labels, values, color="white", height=0.7, zorder=2)
+    ax.axvline(0.0, color="#555555", linewidth=1.0, zorder=1)
+
+    ax.set_title(title, color="white", fontsize=13)
+    ax.set_xlabel(xlabel, color="white", fontsize=10)
+    ax.set_ylabel("Feature", color="#00ff66", fontsize=10)
+    ax.tick_params(axis="both", colors="white", which="both")
+    ax.grid(True, axis="x", color="#333333", linestyle="-", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for lbl in ax.get_yticklabels():
+        lbl.set_color("#00ff66")
+
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
     pred_ret_flat = np.asarray(pred_returns[:, 0]).ravel()
     assert len(pred_ret_flat) == len(test_indices)
 
