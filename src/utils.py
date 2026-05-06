@@ -21,7 +21,6 @@ def predict_loader(model, loader, device):
             ys.append(yb)
     return torch.cat(preds, dim=0), torch.cat(ys, dim=0)
 
-
 def predict_numpy_batches(model, X_np, device, batch_size=512):
     """Run inference on `(N, T, F)` float array; returns `(N, n_out)` on CPU numpy."""
     model.eval()
@@ -34,7 +33,6 @@ def predict_numpy_batches(model, X_np, device, batch_size=512):
             outs.append(model(xb).cpu().numpy())
     return np.concatenate(outs, axis=0)
 
-
 def permutation_feature_importance_mse(
     model,
     X_np,
@@ -43,12 +41,15 @@ def permutation_feature_importance_mse(
     feature_names=None,
     batch_size=512,
     seed=0,
+    target_output_index=None,
 ):
     """Shuffle one input channel across samples (break alignment with targets), measure MSE change.
 
-    `X_np`/`y_np` must be on the **same scale the model sees** (e.g. scaler output). MSE matches
-    `np.mean((pred - y)**2)` over **all outputs and samples** — same normalization as averaging
-    `nn.MSELoss()` over disjoint batches whose total size is `(N * n_outputs)`.
+    `X_np`/`y_np` must be on the **same scale the model sees** (e.g. scaler output).
+
+    If ``target_output_index`` is ``None``, MSE is ``np.mean((pred - y)**2)`` over **all** outputs
+    and samples (like global ``nn.MSELoss``). If set to an int (e.g. ``0`` for daily return, first
+    column of ``cols_y``), only that output column is used: ``np.mean((pred[:, j] - y[:, j])**2)``.
 
     For each feature index ``i``, sets ``Xp[:, :, i] = X[perm, :, i]`` where ``perm`` is a random
     permutation of batch indices — the usual permutation-importance analogue for tensors shaped
@@ -75,8 +76,21 @@ def permutation_feature_importance_mse(
     if len(names) != nfeat:
         raise ValueError(f"Got {len(names)} names but X has {nfeat} channels")
 
+    if target_output_index is not None:
+        j = int(target_output_index)
+        if j < 0 or j >= y_np.shape[-1]:
+            raise ValueError(
+                f"target_output_index={j} out of range for y shape {y_np.shape}"
+            )
+
+    def _output_mse(pred, y):
+        if target_output_index is not None:
+            j = target_output_index
+            return np.mean((pred[:, j] - y[:, j]) ** 2)
+        return np.mean((pred - y) ** 2)
+
     pred0 = predict_numpy_batches(model, X_np, device, batch_size=batch_size)
-    base_mse = np.mean((pred0 - y_np) ** 2)
+    base_mse = _output_mse(pred0, y_np)
 
     deltas = []
     for i in range(nfeat):
@@ -84,7 +98,7 @@ def permutation_feature_importance_mse(
         perm = rng.permutation(n)
         Xp[:, :, i] = X_np[perm, :, i]
         pred = predict_numpy_batches(model, Xp, device, batch_size=batch_size)
-        deltas.append(np.mean((pred - y_np) ** 2) - base_mse)
+        deltas.append(_output_mse(pred, y_np) - base_mse)
 
     return pd.DataFrame({"Feature": names, "mse_increase": deltas}).sort_values(
         "mse_increase", ascending=False
@@ -126,6 +140,8 @@ def plot_permutation_feature_importance(
     if show:
         plt.show()
     return fig, ax
+
+def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_returns):
     pred_ret_flat = np.asarray(pred_returns[:, 0]).ravel()
     assert len(pred_ret_flat) == len(test_indices)
 

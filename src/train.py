@@ -162,7 +162,14 @@ print(
 )
 print(f"Train RMSE (daily return): {train_rmse_ret:.6f} | Test RMSE (daily return): {test_rmse_ret:.6f}")
 
-feature_importance = utils.permutation_feature_importance_mse(model, X_test_scaled, y_test_scaled, device, feature_names=features)
+feature_importance = utils.permutation_feature_importance_mse(
+    model,
+    X_test_scaled,
+    y_test_scaled,
+    device,
+    feature_names=features,
+    target_output_index=0,
+)
 print(feature_importance)
 utils.plot_permutation_feature_importance(feature_importance)
 
