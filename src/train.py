@@ -12,7 +12,6 @@ from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import utils
 from joblib import dump
-from features import features
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -151,7 +150,7 @@ y_test_inv = scaler_y.inverse_transform(y_test_scaled.numpy())
 train_rmse = root_mean_squared_error(y_train_inv, y_train_preds)
 test_rmse = root_mean_squared_error(y_test_inv, y_test_preds)
 
-# Column 0 = daily return (first entry in StockMarketDataset.cols_y).
+# Column 0 = forward total return next bar (H=1; same as one simple return).
 _ret = 0
 train_rmse_ret = root_mean_squared_error(y_train_inv[:, _ret], y_train_preds[:, _ret])
 test_rmse_ret = root_mean_squared_error(y_test_inv[:, _ret], y_test_preds[:, _ret])
@@ -160,14 +159,14 @@ print(
     f"Train RMSE (avg over {nf_out} targets): {train_rmse:.6f} | "
     f"Test RMSE (avg over {nf_out} targets): {test_rmse:.6f}"
 )
-print(f"Train RMSE (daily return): {train_rmse_ret:.6f} | Test RMSE (daily return): {test_rmse_ret:.6f}")
+print(f"Train RMSE (next-bar total, H=1): {train_rmse_ret:.6f} | Test: {test_rmse_ret:.6f}")
 
 feature_importance = utils.permutation_feature_importance_mse(
     model,
     X_test_scaled,
     y_test_scaled,
     device,
-    feature_names=features,
+    feature_names=full_ds.input_feature_names,
     target_output_index=0,
 )
 print(feature_importance)

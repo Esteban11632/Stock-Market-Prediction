@@ -4,11 +4,17 @@ import torch
 from torch.utils.data import Dataset
 
 class StockMarketDataset(Dataset):
-    """Sliding windows: X[t] stacks input channels; y is next-bar targets only.
+    """Sliding windows: X stacks past inputs; targets are forward-looking returns.
 
-    Input (`cols_x`) can be wider than output (`cols_y`): e.g. add MAs to X while
-    still predicting only the core 5-vector for the next day.
-    Rows with incomplete rolling-window features are skipped via ``_warmup``.
+    For dataset index ending with bar ``t``, each label ``y[..., j]`` reads the same pandas row
+    index :math:`\\text{lbl} = t+1` (`base + seq_length` in ``__getitem__``) and predicts
+    **compound simple total return** over the **next** ``H`` trading-bar daily returns beginning
+    that day: :math:`\\prod_{k=0}^{H-1}(1+r_{\\text{lbl}+k})-1` where :math:`r` is ``close.pct_change()``.
+
+    Rows with incomplete **past** features are skipped via ``_warmup``. Rows lacking enough
+    **future** returns for long horizons drop off the dataset via ``len`` (tail trim).
+
+    Use ``input_feature_names`` / ``target_column_names`` for labels aligned with tensor columns.
     """
 
     def __init__(self, df, seq_length):
@@ -52,18 +58,23 @@ class StockMarketDataset(Dataset):
         self.vol_chg = vol_chg
         self.close_pos = close_pos
 
-        # Targets: next timestep of these channels only
-        self.cols_y = [
-            self.returns,
-            self.body,
-            #self.range,
-            self.vol_chg,
-            self.close_pos,
-        ]
+        # Forward compounded totals from prediction bar onward (see class docstring).
+        self._fwd_target_specs = (
+            ("fwd_tot_next_bar", 1),
+            ("fwd_tot_5bd", 5),
+            ("fwd_tot_20bd", 20),
+        )
+        self._fwd_horizon_max = max(h for _, h in self._fwd_target_specs)
+        _fwd_totals = StockMarketDataset.forward_compounded_totals_from_here(
+            returns_s,
+            tuple(h for _, h in self._fwd_target_specs),
+        )
+        self.cols_y = [_fwd_totals[h] for _, h in self._fwd_target_specs]
+        self.target_column_names = tuple(name for name, _ in self._fwd_target_specs)
+        assert len(self.target_column_names) == len(self.cols_y)
 
-        # Moving averages
         self.ma_windows = (5, 10, 20)
-        self._warmup = max(self.ma_windows) - 1
+        self._warmup = max(w - 1 for w in self.ma_windows)
         # Closing-price SMA (textbook Ma_N = mean of last N closes); aligned to idx like other cols_y
         self.moving_average_5 = self.get_moving_average(5, close).reindex(idx)
         self.moving_average_10 = self.get_moving_average(10, close).reindex(idx)
@@ -84,16 +95,26 @@ class StockMarketDataset(Dataset):
         self.bollinger_bands_20_lower = (
             self.bollinger_bands_20 - 2 * self.bollinger_bands_20_std
         )
-        self.cols_x = list(self.cols_y) + [
-            self.moving_average_5,
-            self.moving_average_10,
-            self.moving_average_20,
-            self.rolling_volatility_5,
-            self.rolling_volatility_10,
-            self.bollinger_bands_20,
-            self.bollinger_bands_20_upper,
-            self.bollinger_bands_20_lower
-        ]
+        
+        _x_extra_specs = (
+            ("body", self.body),
+            ("range", self.range),
+            ("vol_chg", self.vol_chg),
+            ("close_pos", self.close_pos),
+            ("ma_5", self.moving_average_5),
+            ("ma_10", self.moving_average_10),
+            ("ma_20", self.moving_average_20),
+            ("roll_vol_5", self.rolling_volatility_5),
+            ("roll_vol_10", self.rolling_volatility_10),
+            ("bb_mid", self.bollinger_bands_20),
+            ("bb_upper", self.bollinger_bands_20_upper),
+            ("bb_lower", self.bollinger_bands_20_lower),
+        )
+        self.cols_x = [series for _, series in _x_extra_specs]
+        self.input_feature_names = tuple(
+            name for name, _ in _x_extra_specs
+        )
+        assert len(self.input_feature_names) == len(self.cols_x)
 
     @property
     def n_features_in(self) -> int:
@@ -104,13 +125,44 @@ class StockMarketDataset(Dataset):
         return len(self.cols_y)
 
     def __len__(self):
-        usable = len(self.returns) - self.seq_length - self._warmup
+        usable = (
+            len(self.returns)
+            - self.seq_length
+            - self._warmup
+            - (self._fwd_horizon_max - 1)
+        )
         if usable < 0:
             raise ValueError(
-                "Not enough rows after warmup for this seq_length; "
-                "increase history or shorten seq_length / MA horizon."
+                "Not enough rows after warmup / forward horizons for seq_length; "
+                "increase history, shorten horizons, or reduce seq_length / warmup."
             )
         return usable
+
+    @staticmethod
+    def forward_compounded_totals_from_here(daily_returns: pd.Series, horizons: tuple[int, ...]):
+        """Compound total simple return starting at **each bar** over the **next H** closes.
+
+        At index ``t`` uses daily simple returns ``r[t], ..., r[t+H-1]`` (``H`` terms).
+        For ``H=1`` this equals ``daily_returns``. NaN where the forward window isn't complete.
+        """
+        horizons_u = tuple(sorted(set(int(h) for h in horizons)))
+        ix = daily_returns.index
+        v = np.asarray(daily_returns.to_numpy(dtype=float), dtype=np.float64)
+        n = len(v)
+        out = {}
+        for H in horizons_u:
+            if H < 1:
+                raise ValueError("Horizon must be >= 1")
+            cs = np.zeros(n + 1, dtype=np.float64)
+            cs[1:] = np.cumsum(np.log1p(v))
+            if H <= n:
+                sums = cs[H:] - cs[:-H]
+                arr = np.full(n, np.nan, dtype=np.float64)
+                arr[: n - H + 1] = np.expm1(sums)
+                out[H] = pd.Series(arr, index=ix)
+            else:
+                out[H] = pd.Series(np.nan, index=ix)
+        return out
 
     def get_moving_average(self, window_size, col):
         return col.rolling(window=window_size, min_periods=window_size).mean()
