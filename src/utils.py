@@ -2,7 +2,6 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from pandas.tseries.offsets import BDay
 from sklearn.metrics import root_mean_squared_error
 
 def get_column_normalized_to_1d(df, column_name):
@@ -48,8 +47,8 @@ def permutation_feature_importance_mse(
     `X_np`/`y_np` must be on the **same scale the model sees** (e.g. scaler output).
 
     If ``target_output_index`` is ``None``, MSE is ``np.mean((pred - y)**2)`` over **all** outputs
-    and samples (like global ``nn.MSELoss``). If set to an int (e.g. ``0`` for daily return, first
-    column of ``cols_y``), only that output column is used: ``np.mean((pred[:, j] - y[:, j])**2)``.
+    and samples (like global ``nn.MSELoss``). If set to an int (e.g. ``0`` for next-bar forward
+    total return), only that output column is used: ``np.mean((pred[:, j] - y[:, j])**2)``.
 
     For each feature index ``i``, sets ``Xp[:, :, i] = X[perm, :, i]`` where ``perm`` is a random
     permutation of batch indices — the usual permutation-importance analogue for tensors shaped
@@ -167,95 +166,110 @@ def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_retu
 
     return pred_prices, actual_prices, test_dates
 
-def recursive_forecast(
-    model,
-    df,
-    full_ds,
-    seq_length,
-    scaler_X,
-    scaler_y,
-    device,
-    horizon,
-    nf_in,
-    pred_prices,
+
+def _compound_returns_to_terminal_closes(prev_close: float, compound_returns_row):
+    """Map forward compound simple returns starting at anchor to closes at matching horizons."""
+    row = np.asarray(compound_returns_row, dtype=np.float64).ravel()
+    return prev_close * (1.0 + row)
+
+
+def forecast_price_path_from_last_sample(
+    df, full_ds, seq_length, dataset_index_last, y_pred_last, y_true_last=None
+):
+    """From last dataset row: dates and closes at ends of fwd 1, 5, 20 trading days (same anchor)."""
+    close = get_column_normalized_to_1d(df, "Close")
+    r_ix = full_ds.returns.index
+    p = dataset_index_last + full_ds._warmup + seq_length
+    if p + 19 >= len(r_ix):
+        raise ValueError(
+            "Not enough trailing bars to plot 20bd horizon for this sample; "
+            "use shorter horizons or ensure history covers p+19."
+        )
+    prev_c = float(close.loc[r_ix[p - 1]])
+    horizon_offsets = (0, 4, 19)
+    dates = pd.DatetimeIndex([r_ix[p + o] for o in horizon_offsets])
+    pred_row = np.asarray(y_pred_last, dtype=np.float64).ravel()
+    pred_closes = _compound_returns_to_terminal_closes(prev_c, pred_row)
+    realized_closes = None
+    if y_true_last is not None:
+        true_row = np.asarray(y_true_last, dtype=np.float64).ravel()
+        if true_row.shape == pred_row.shape and np.all(np.isfinite(true_row)):
+            realized_closes = _compound_returns_to_terminal_closes(prev_c, true_row)
+    return dates, np.asarray(pred_closes, dtype=np.float64), realized_closes
+
+
+def graph_predictions(
+    ticker,
     test_dates,
     actual_prices,
-    nf_out=None,
+    pred_prices,
+    test_rmse_price=None,
+    *,
+    forward_forecast=None,
 ):
-    if nf_out is None:
-        nf_out = nf_in
-    last_idx = len(full_ds) - 1
-    window = full_ds[last_idx][0].numpy().copy()
-    close = get_column_normalized_to_1d(df, "Close")
-    r = full_ds.returns
-    anchor_i = last_idx + full_ds._warmup + seq_length - 1
-    forecast_i = last_idx + full_ds._warmup + seq_length
-    price_curr = float(close.loc[r.index[anchor_i]])
-    recursive_prices = [price_curr]
-    recursive_returns = []
-    model.eval()
-    with torch.inference_mode():
-        for _ in range(horizon):
-            flat = window.reshape(-1, nf_in)
-            X_scaled = scaler_X.transform(flat).reshape(seq_length, nf_in).astype(np.float32)
-            xb = torch.tensor(X_scaled, device=device).unsqueeze(0)
-            pred_scaled = model(xb)
-            y_pred = scaler_y.inverse_transform(pred_scaled.cpu().numpy())[0].reshape(-1)
-            r_pred = float(y_pred[0])
-            recursive_returns.append(r_pred)
-            price_curr = price_curr * (1.0 + r_pred)
-            recursive_prices.append(price_curr)
-            window = np.roll(window, -1, axis=0)
-            y_full = np.zeros(nf_in, dtype=np.float64)
-            y_full[: min(nf_out, len(y_pred))] = y_pred[:nf_out]
-            if nf_out < nf_in:
-                y_full[nf_out:] = window[-2, nf_out:nf_in]
-            window[-1] = y_full
+    """Actual vs one-step pred close; optional overlay of horizon price forecasts (last sample)."""
+    actual_prices = np.asarray(actual_prices, dtype=np.float64).ravel()
+    pred_prices = np.asarray(pred_prices, dtype=np.float64).ravel()
+    if test_rmse_price is None:
+        test_rmse_price = root_mean_squared_error(actual_prices, pred_prices)
+        print(f"RMSE (price, one-step next-bar): {test_rmse_price:.4f}")
 
-    recursive_prices = np.array(recursive_prices, dtype=np.float64)
-    print(
-        f"Recursive {horizon}-day forecast (anchor close {r.index[anchor_i]}; next bar {r.index[forecast_i]}): "
-        f"{recursive_prices.round(4)}"
-    )
-
-    # Append multi-day forecast to pred series for plotting (future business days; no actuals yet)
-    future_dates = pd.date_range(
-        start=r.index[-1] + BDay(1), periods=horizon, freq="B"
-    )
-    pred_prices_plot = np.concatenate([pred_prices, recursive_prices[1:]])
-    dates_plot = pd.DatetimeIndex(
-        np.concatenate([test_dates.to_numpy(), future_dates.to_numpy()])
-    )
-    actual_prices_plot = np.concatenate([actual_prices, np.full(horizon, np.nan)])
-
-    test_rmse_price = root_mean_squared_error(actual_prices, pred_prices)
-    print(f"Test RMSE (price, one-step from pred. returns): {test_rmse_price:.4f}")
-
-    return dates_plot, actual_prices_plot, pred_prices_plot, test_rmse_price, test_dates, horizon, actual_prices, pred_prices
-
-def graph_predictions(dates_plot, actual_prices_plot, pred_prices_plot, test_rmse_price, test_dates, ticker, horizon, actual_prices, pred_prices):
     fig = plt.figure(figsize=(10, 8))
     gs = fig.add_gridspec(4, 1)
     ax1 = fig.add_subplot(gs[:3, 0])
     ax2 = fig.add_subplot(gs[3, 0])
 
-    ax1.plot(dates_plot, actual_prices_plot, color="blue", label="Actual close")
+    ax1.plot(test_dates, actual_prices, color="blue", label="Actual close")
     ax1.plot(
-        dates_plot,
-        pred_prices_plot,
+        test_dates,
+        pred_prices,
         color="green",
-        label="Pred. close (test) + recursive forecast",
+        label="Pred. close (one-step)",
     )
-    ax1.set_title(f"{ticker} test — one-step + {horizon}-day recursive forecast")
+
+    title = f"{ticker} — predicted vs actual close"
+
+    if forward_forecast:
+        fd = pd.DatetimeIndex(forward_forecast["forecast_dates"])
+        fp = np.asarray(forward_forecast["pred_closes"], dtype=np.float64).ravel()
+        ax1.plot(
+            fd,
+            fp,
+            color="darkgreen",
+            linestyle="--",
+            marker="o",
+            linewidth=2,
+            markersize=7,
+            label="Pred. closes (fwd 1 / 5 / 20 bd from last anchor)",
+            zorder=5,
+        )
+        rc = forward_forecast.get("realized_closes")
+        if rc is not None:
+            rc = np.asarray(rc, dtype=np.float64).ravel()
+            ok = np.isfinite(rc)
+            if ok.any():
+                ax1.scatter(
+                    fd[ok],
+                    rc[ok],
+                    color="navy",
+                    s=52,
+                    marker="s",
+                    zorder=6,
+                    label="Realized closes at horizons (last sample)",
+                )
+        ax1.axvline(fd[0], color="gray", linestyle=":", linewidth=1, alpha=0.8)
+        title = f"{ticker} — close + horizon price forecast (last sample)"
+
+    ax1.set_title(title)
     ax1.set_xlabel("Date")
     ax1.set_ylabel("Price")
     ax1.grid(True)
-    ax1.legend()
+    ax1.legend(loc="best", fontsize=8)
 
     err = np.abs(actual_prices - pred_prices)
-    ax2.axhline(test_rmse_price, color="blue", linestyle="--", label="Test RMSE (price)")
-    ax2.plot(test_dates, err, "r", label="Absolute price error (test only)")
-    ax2.set_title(f"{ticker} prediction error (price space)")
+    ax2.axhline(test_rmse_price, color="blue", linestyle="--", label="RMSE (price)")
+    ax2.plot(test_dates, err, color="red", label="Absolute price error")
+    ax2.set_title(f"{ticker} — price error (one-step)")
     ax2.set_xlabel("Date")
     ax2.set_ylabel("Error")
     ax2.grid(True)

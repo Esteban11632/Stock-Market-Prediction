@@ -52,25 +52,33 @@ model.load_state_dict(state)
 y_pred_scaled, y_true_scaled = utils.predict_loader(model, test_loader, device)
 y_pred = scaler_y.inverse_transform(y_pred_scaled.numpy())
 y_true = scaler_y.inverse_transform(y_true_scaled.numpy())
-# Column 0 = daily return (StockMarketDataset.cols_y[0]).
+# Column 0 = forward total return over next bar (= next simple return); used for one-step price reconstruction.
 _rmse_ret = root_mean_squared_error(y_true[:, 0], y_pred[:, 0])
-print(f"RMSE (daily return): {_rmse_ret:.6f}")
+print(f"RMSE (next-bar total, H=1): {_rmse_ret:.6f}")
 indices = list(range(0, len(X_scaled)))
-pred_prices, actual_prices, test_dates = utils.predicted_returns_to_prices(df, full_ds, indices, seq_length, y_pred)
-horizon = 5
-dates_plot, actual_prices_plot, pred_prices_plot, test_rmse_price, test_dates, horizon, actual_prices, pred_prices = utils.recursive_forecast(
-    model,
-    df,
-    full_ds,
-    seq_length,
-    scaler_X,
-    scaler_y,
-    device,
-    horizon,
-    nf_in,
-    pred_prices,
+pred_prices, actual_prices, test_dates = utils.predicted_returns_to_prices(
+    df, full_ds, indices, seq_length, y_pred
+)
+_rmse_price = root_mean_squared_error(actual_prices, pred_prices)
+print(f"RMSE (price, one-step next-bar): {_rmse_price:.4f}")
+
+k_last = indices[-1]
+forward_forecast = None
+try:
+    fd, pred_fc, real_fc = utils.forecast_price_path_from_last_sample(
+        df, full_ds, seq_length, k_last, y_pred[-1], y_true[-1]
+    )
+    forward_forecast = {"forecast_dates": fd, "pred_closes": pred_fc}
+    if real_fc is not None:
+        forward_forecast["realized_closes"] = real_fc
+except ValueError as exc:
+    print(f"Skipping horizon price overlay: {exc}")
+
+utils.graph_predictions(
+    ticker,
     test_dates,
     actual_prices,
-    nf_out=nf_out,
+    pred_prices,
+    test_rmse_price=_rmse_price,
+    forward_forecast=forward_forecast,
 )
-utils.graph_predictions(dates_plot, actual_prices_plot, pred_prices_plot, test_rmse_price, test_dates, ticker, horizon, actual_prices, pred_prices)
