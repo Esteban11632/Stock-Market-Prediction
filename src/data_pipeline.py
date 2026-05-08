@@ -4,12 +4,13 @@ import torch
 from torch.utils.data import Dataset
 
 class StockMarketDataset(Dataset):
-    """Sliding windows: X stacks past inputs; targets are forward-looking returns.
+    """Sliding windows: X stacks past inputs; targets are forward cumulative **log** returns.
 
-    For dataset index ending with bar ``t``, each label ``y[..., j]`` reads the same pandas row
-    index :math:`\\text{lbl} = t+1` (`base + seq_length` in ``__getitem__``) and predicts
-    **compound simple total return** over the **next** ``H`` trading-bar daily returns beginning
-    that day: :math:`\\prod_{k=0}^{H-1}(1+r_{\\text{lbl}+k})-1` where :math:`r` is ``close.pct_change()``.
+    Daily series ``self.returns`` is **natural log return** :math:`\\ln(P_t/P_{t-1})`.
+
+    For dataset index ending with bar ``t``, each label ``y[..., j]`` at row ``lbl`` is the **sum**
+    of the next ``H`` daily log returns starting that day,
+    :math:`\\sum_{k=0}^{H-1} L_{\\text{lbl}+k} = \\ln(P_{\\text{lbl}+H-1}/P_{\\text{lbl}-1})`.
 
     Rows with incomplete **past** features are skipped via ``_warmup``. Rows lacking enough
     **future** returns for long horizons drop off the dataset via ``len`` (tail trim).
@@ -41,7 +42,10 @@ class StockMarketDataset(Dataset):
 
         self.seq_length = seq_length
 
-        returns_s = close.pct_change().dropna()
+        close_f = close.astype(np.float64)
+        returns_s = (
+            np.log(close_f).diff().replace([np.inf, -np.inf], np.nan).dropna()
+        )
         idx = returns_s.index
         body = (close - open_).reindex(idx)
         range_ = (high - low).reindex(idx)
@@ -58,14 +62,15 @@ class StockMarketDataset(Dataset):
         self.vol_chg = vol_chg
         self.close_pos = close_pos
 
-        # Forward compounded totals from prediction bar onward (see class docstring).
+        # Forward cumulative log-return targets from prediction bar onward (see class docstring).
         self._fwd_target_specs = (
             ("fwd_tot_next_bar", 1),
-            ("fwd_tot_5bd", 5),
-            ("fwd_tot_20bd", 20),
+            ("fwd_tot_1w", 5),
+            ("fwd_tot_1m", 20),
+            ("fwd_tot_3m", 60)
         )
         self._fwd_horizon_max = max(h for _, h in self._fwd_target_specs)
-        _fwd_totals = StockMarketDataset.forward_compounded_totals_from_here(
+        _fwd_totals = StockMarketDataset.forward_cumulative_log_returns_from_here(
             returns_s,
             tuple(h for _, h in self._fwd_target_specs),
         )
@@ -139,26 +144,27 @@ class StockMarketDataset(Dataset):
         return usable
 
     @staticmethod
-    def forward_compounded_totals_from_here(daily_returns: pd.Series, horizons: tuple[int, ...]):
-        """Compound total simple return starting at **each bar** over the **next H** closes.
+    def forward_cumulative_log_returns_from_here(daily_log_returns: pd.Series, horizons: tuple[int, ...]):
+        """Cumulative **log** return over the **next H** bars: sum of daily log returns.
 
-        At index ``t`` uses daily simple returns ``r[t], ..., r[t+H-1]`` (``H`` terms).
-        For ``H=1`` this equals ``daily_returns``. NaN where the forward window isn't complete.
+        At index ``t`` the value is :math:`\\sum_{k=0}^{H-1} L[t+k]` where ``L`` are daily log
+        returns. That equals :math:`\\ln(P_{t+H-1}/P_{t-1})` for positive prices. For ``H=1`` this
+        is a single-day log return. NaN where the forward window is incomplete.
         """
         horizons_u = tuple(sorted(set(int(h) for h in horizons)))
-        ix = daily_returns.index
-        v = np.asarray(daily_returns.to_numpy(dtype=float), dtype=np.float64)
+        ix = daily_log_returns.index
+        v = np.asarray(daily_log_returns.to_numpy(dtype=float), dtype=np.float64)
         n = len(v)
         out = {}
         for H in horizons_u:
             if H < 1:
                 raise ValueError("Horizon must be >= 1")
             cs = np.zeros(n + 1, dtype=np.float64)
-            cs[1:] = np.cumsum(np.log1p(v))
+            cs[1:] = np.cumsum(v)
             if H <= n:
                 sums = cs[H:] - cs[:-H]
                 arr = np.full(n, np.nan, dtype=np.float64)
-                arr[: n - H + 1] = np.expm1(sums)
+                arr[: n - H + 1] = sums
                 out[H] = pd.Series(arr, index=ix)
             else:
                 out[H] = pd.Series(np.nan, index=ix)

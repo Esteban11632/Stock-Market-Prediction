@@ -150,7 +150,7 @@ y_test_inv = scaler_y.inverse_transform(y_test_scaled.numpy())
 train_rmse = root_mean_squared_error(y_train_inv, y_train_preds)
 test_rmse = root_mean_squared_error(y_test_inv, y_test_preds)
 
-# Column 0 = forward total return next bar (H=1; same as one simple return).
+# Column 0 = cumulative log return over next 1 bar (= daily log return at label day).
 _ret = 0
 train_rmse_ret = root_mean_squared_error(y_train_inv[:, _ret], y_train_preds[:, _ret])
 test_rmse_ret = root_mean_squared_error(y_test_inv[:, _ret], y_test_preds[:, _ret])
@@ -159,7 +159,7 @@ print(
     f"Train RMSE (avg over {nf_out} targets): {train_rmse:.6f} | "
     f"Test RMSE (avg over {nf_out} targets): {test_rmse:.6f}"
 )
-print(f"Train RMSE (next-bar total, H=1): {train_rmse_ret:.6f} | Test: {test_rmse_ret:.6f}")
+print(f"Train RMSE (1-day cumulative log return): {train_rmse_ret:.6f} | Test: {test_rmse_ret:.6f}")
 
 feature_importance = utils.permutation_feature_importance_mse(
     model,

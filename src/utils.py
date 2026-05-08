@@ -47,8 +47,8 @@ def permutation_feature_importance_mse(
     `X_np`/`y_np` must be on the **same scale the model sees** (e.g. scaler output).
 
     If ``target_output_index`` is ``None``, MSE is ``np.mean((pred - y)**2)`` over **all** outputs
-    and samples (like global ``nn.MSELoss``). If set to an int (e.g. ``0`` for next-bar forward
-    total return), only that output column is used: ``np.mean((pred[:, j] - y[:, j])**2)``.
+    and samples (like global ``nn.MSELoss``). If set to an int (e.g. ``0`` for 1-day cumulative log
+    return), only that output column is used: ``np.mean((pred[:, j] - y[:, j])**2)``.
 
     For each feature index ``i``, sets ``Xp[:, :, i] = X[perm, :, i]`` where ``perm`` is a random
     permutation of batch indices — the usual permutation-importance analogue for tensors shaped
@@ -141,6 +141,7 @@ def plot_permutation_feature_importance(
     return fig, ax
 
 def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_returns):
+    """Map predicted **daily log return** (column 0) to next close: ``prev * exp(pred)``."""
     pred_ret_flat = np.asarray(pred_returns[:, 0]).ravel()
     assert len(pred_ret_flat) == len(test_indices)
 
@@ -156,7 +157,7 @@ def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_retu
     for j, k in enumerate(test_indices):
         p = k + full_ds._warmup + seq_length
         prev_c = float(close.loc[r.index[p - 1]])
-        pred_prices.append(prev_c * (1.0 + float(pred_ret_flat[j])))
+        pred_prices.append(prev_c * float(np.exp(pred_ret_flat[j])))
         actual_prices.append(float(close.loc[r.index[p]]))
         test_dates.append(r.index[p])
 
@@ -167,34 +168,40 @@ def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_retu
     return pred_prices, actual_prices, test_dates
 
 
-def _compound_returns_to_terminal_closes(prev_close: float, compound_returns_row):
-    """Map forward compound simple returns starting at anchor to closes at matching horizons."""
-    row = np.asarray(compound_returns_row, dtype=np.float64).ravel()
-    return prev_close * (1.0 + row)
-
+def _cumulative_log_targets_to_terminal_closes(prev_close: float, cumulative_log_row):
+    """Terminal close from anchor and each head's **cumulative log return** (sum of daily L)."""
+    row = np.asarray(cumulative_log_row, dtype=np.float64).ravel()
+    return prev_close * np.exp(row)
 
 def forecast_price_path_from_last_sample(
     df, full_ds, seq_length, dataset_index_last, y_pred_last, y_true_last=None
 ):
-    """From last dataset row: dates and closes at ends of fwd 1, 5, 20 trading days (same anchor)."""
+    """From last dataset row: dates and closes at each forward horizon (same order as ``cols_y``)."""
     close = get_column_normalized_to_1d(df, "Close")
     r_ix = full_ds.returns.index
     p = dataset_index_last + full_ds._warmup + seq_length
-    if p + 19 >= len(r_ix):
+    horizons = tuple(h for _, h in full_ds._fwd_target_specs)
+    pred_row = np.asarray(y_pred_last, dtype=np.float64).ravel()
+    if len(pred_row) != len(horizons):
         raise ValueError(
-            "Not enough trailing bars to plot 20bd horizon for this sample; "
-            "use shorter horizons or ensure history covers p+19."
+            f"y_pred row has {len(pred_row)} cols but _fwd_target_specs defines {len(horizons)} horizons"
+        )
+    # Compound H returns uses bars p..p+H-1; terminal close is end of day p+H-1.
+    horizon_day_offsets = tuple(h - 1 for h in horizons)
+    max_off = max(horizon_day_offsets)
+    if p + max_off >= len(r_ix):
+        raise ValueError(
+            f"Not enough trailing bars (need index p+{max_off} < {len(r_ix)}); "
+            "shorten longest horizon or use more price history."
         )
     prev_c = float(close.loc[r_ix[p - 1]])
-    horizon_offsets = (0, 4, 19)
-    dates = pd.DatetimeIndex([r_ix[p + o] for o in horizon_offsets])
-    pred_row = np.asarray(y_pred_last, dtype=np.float64).ravel()
-    pred_closes = _compound_returns_to_terminal_closes(prev_c, pred_row)
+    dates = pd.DatetimeIndex([r_ix[p + o] for o in horizon_day_offsets])
+    pred_closes = _cumulative_log_targets_to_terminal_closes(prev_c, pred_row)
     realized_closes = None
     if y_true_last is not None:
         true_row = np.asarray(y_true_last, dtype=np.float64).ravel()
         if true_row.shape == pred_row.shape and np.all(np.isfinite(true_row)):
-            realized_closes = _compound_returns_to_terminal_closes(prev_c, true_row)
+            realized_closes = _cumulative_log_targets_to_terminal_closes(prev_c, true_row)
     return dates, np.asarray(pred_closes, dtype=np.float64), realized_closes
 
 
@@ -240,7 +247,7 @@ def graph_predictions(
             marker="o",
             linewidth=2,
             markersize=7,
-            label="Pred. closes (fwd 1 / 5 / 20 bd from last anchor)",
+            label="Pred. closes (fwd 1d / 1w / 1m / 3m from last anchor)",
             zorder=5,
         )
         rc = forward_forecast.get("realized_closes")

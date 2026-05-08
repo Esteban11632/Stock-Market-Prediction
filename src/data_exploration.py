@@ -49,7 +49,7 @@ t = ds.returns.index
 
 fig2, axes = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
 rows = [
-    (ds.returns, "Daily return (pct change)", "return"),
+    (ds.returns, "Daily log return", "log return"),
     (ds.body, "Intraday body (Close - Open)", "body"),
     (ds.range, "Intraday range (High - Low)", "range"),
     (ds.vol_chg, r"Volume change ($V_t / V_{t-1}$)", "vol. change"),
@@ -113,7 +113,7 @@ if vol_series:
     axes_rv[0].plot(t, ds.returns, color="black", linewidth=0.55, alpha=0.85, label="return")
     axes_rv[0].axhline(0.0, color="gray", linewidth=0.45, alpha=0.6)
     axes_rv[0].set_ylabel("daily return")
-    axes_rv[0].set_title(f"{ticker} — returns (top) vs rolling std of returns (bottom)")
+    axes_rv[0].set_title(f"{ticker} — log returns (top) vs rolling std of log returns (bottom)")
     axes_rv[0].grid(True, alpha=0.35)
     axes_rv[0].legend(loc="upper left", fontsize=8)
 
