@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 import mplfinance as mpf
-
+from sklearn.feature_selection import mutual_info_regression
 from data_pipeline import StockMarketDataset
+import utils as sm_utils
+import seaborn as sns
 
 ticker = "VOO"
 
@@ -255,3 +255,52 @@ if getattr(ds, "bollinger_bands_20", None) is not None:
     fig_bbs.suptitle(f"{ticker} — Bollinger %B vs returns", y=1.02, fontsize=12)
     fig_bbs.tight_layout()
     plt.show()
+
+# Mutual information (whole window flattened → one MI score per timestep × channel)
+seq_length = [5, 10, 20]
+for seq_len in seq_length:
+    ds = StockMarketDataset(df, seq_len)
+
+    print(f"StockMarketDataset with sequence length {seq_len} created")
+
+    X, y = ds.as_numpy()
+    X_flat = X.reshape(X.shape[0], -1)
+    L_win, n_feat = ds.seq_length, len(ds.cols_x)
+    targets = {
+        "next_bar": y[:, 0],
+        "1w": y[:, 1],
+        "1m": y[:, 2],
+        "3m": y[:, 3],
+    }
+    _mi_panels = {}
+    for target_name, target_data in targets.items():
+        mi = mutual_info_regression(X_flat, target_data)
+        # print(f"{target_name} MI (flattened timestep×channel):\n{mi}")
+        _mi_panels[target_name] = mi
+
+    sm_utils.plot_window_flat_scores(
+        _mi_panels,
+        L_win,
+        ds.input_feature_names,
+        zlabel="mutual information (nats, sklearn est.)",
+        suptitle=(
+            f"{ticker}: MI between each input cell in the LxF window vs target "
+            "(row 0 = oldest bar in window)"
+        ),
+        cmap="viridis",
+        share_scale=False,
+    )
+
+# Correlation between features
+X, y = ds.as_numpy()
+
+# reshape from (N, T, F) to (N*T, F)
+X_features = X.reshape(-1, X.shape[2])
+
+X_feat_df = pd.concat(
+    [s.rename(n) for n, s in zip(ds.input_feature_names, ds.cols_x)],
+    axis=1,
+).corr()
+
+sns.heatmap(X_feat_df, cmap="coolwarm", center=0, annot=True, fmt=".2f")
+plt.show()

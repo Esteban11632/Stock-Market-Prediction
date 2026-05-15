@@ -5,11 +5,13 @@ import yfinance as yf
 from torch.utils.data import DataLoader, TensorDataset
 from joblib import load
 from cnn_lstm_attention import ConvLSTMAttentionStockModel
+from config import get_config
 from data_pipeline import StockMarketDataset
 import utils
 
-ticker = "VOO"
-seq_length = 10
+config = get_config()
+ticker = config["ticker"]
+seq_length = config["seq_length"]
 
 df = yf.download(ticker, start="2024-01-01")
 
@@ -45,6 +47,7 @@ test_loader = DataLoader(
 model = ConvLSTMAttentionStockModel(
     input_dim=nf_in,
     output_dim=nf_out,
+    num_lstm_layers=config["num_lstm_layers"]
 ).to(device)
 state = torch.load(models_dir / filename, map_location=device)
 model.load_state_dict(state)

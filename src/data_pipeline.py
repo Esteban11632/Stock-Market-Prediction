@@ -102,18 +102,19 @@ class StockMarketDataset(Dataset):
         )
         
         _x_extra_specs = (
+            ("returns", self.returns),
             ("body", self.body),
             ("range", self.range),
             ("vol_chg", self.vol_chg),
             ("close_pos", self.close_pos),
             ("ma_5", self.moving_average_5),
-            ("ma_10", self.moving_average_10),
-            ("ma_20", self.moving_average_20),
+            #("ma_10", self.moving_average_10),
+            #("ma_20", self.moving_average_20),
             ("roll_vol_5", self.rolling_volatility_5),
             ("roll_vol_10", self.rolling_volatility_10),
-            ("bb_mid", self.bollinger_bands_20),
-            ("bb_upper", self.bollinger_bands_20_upper),
-            ("bb_lower", self.bollinger_bands_20_lower),
+            #("bb_mid", self.bollinger_bands_20),
+            #("bb_upper", self.bollinger_bands_20_upper),
+            #("bb_lower", self.bollinger_bands_20_lower),
         )
         self.cols_x = [series for _, series in _x_extra_specs]
         self.input_feature_names = tuple(
@@ -188,10 +189,14 @@ class StockMarketDataset(Dataset):
 
     def __getitem__(self, idx):
         base = idx + self._warmup
+
+        # Get the window of features
         X = np.stack(
             [col.iloc[base : base + self.seq_length].values for col in self.cols_x],
             axis=-1,
         )
+
+        # Get the target (first value after the window)
         y = np.array(
             [col.iloc[base + self.seq_length] for col in self.cols_y],
             dtype=np.float64,

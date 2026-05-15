@@ -67,6 +67,8 @@ class ConvLSTMAttentionStockModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # L: days in the window
+        # F: features
         # x: (B, L, F)
         b = x.size(0)
         xc = x.transpose(1, 2)  # (B, F, L)

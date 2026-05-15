@@ -12,14 +12,16 @@ from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import utils
 from joblib import dump
+from config import get_config
+import shap
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-ticker = "VOO"
+config = get_config()
+ticker = config["ticker"]
+seq_length = config["seq_length"]
 
 df = yf.download(ticker, start="2000-01-01", end="2023-12-31")
-
-seq_length = 10
 
 full_ds = StockMarketDataset(df, seq_length)
 X_train, X_val, X_test, y_train, y_val, y_test = split_data(full_ds)
@@ -87,7 +89,8 @@ def mse_mean_over_batches(loader, model, criterion, device, out_dim):
 
 model = ConvLSTMAttentionStockModel(
     input_dim=nf_in,
-    output_dim=nf_out
+    output_dim=nf_out,
+    num_lstm_layers=config["num_lstm_layers"]
 ).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
@@ -171,6 +174,9 @@ feature_importance = utils.permutation_feature_importance_mse(
 )
 print(feature_importance)
 utils.plot_permutation_feature_importance(feature_importance)
+
+# SHAP
+
 
 # Save the model and scalers
 directory = Path(__file__).resolve().parent.parent

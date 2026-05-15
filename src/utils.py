@@ -3,6 +3,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import root_mean_squared_error
+import shap
 
 def get_column_normalized_to_1d(df, column_name):
     column = df[column_name].squeeze()
@@ -19,6 +20,21 @@ def predict_loader(model, loader, device):
             preds.append(model(Xb).cpu())
             ys.append(yb)
     return torch.cat(preds, dim=0), torch.cat(ys, dim=0)
+
+
+def get_shap_values(model, X, device, background_size=100, sample_size=50):
+    model.eval()
+
+    background_size = min(background_size, len(X))
+    sample_size = min(sample_size, len(X))
+
+    background = torch.from_numpy(X[:background_size]).float().to(device)
+    samples = torch.from_numpy(X[:sample_size]).float().to(device)
+
+    explainer = shap.GradientExplainer(model, background)
+    shap_values = explainer.shap_values(samples)
+
+    return shap_values, samples
 
 def predict_numpy_batches(model, X_np, device, batch_size=512):
     """Run inference on `(N, T, F)` float array; returns `(N, n_out)` on CPU numpy."""
@@ -102,6 +118,105 @@ def permutation_feature_importance_mse(
     return pd.DataFrame({"Feature": names, "mse_increase": deltas}).sort_values(
         "mse_increase", ascending=False
     )
+
+
+def window_scores_flat_to_grid(
+    flat_scores: np.ndarray, seq_length: int, feature_names
+) -> pd.DataFrame:
+    """Flattened row-major `(time, feat)` matching ``X.reshape(n, -1)`` from ``X`` shaped ``(N, L, F)``.
+
+    Row 0 of the grid is **oldest** timestep in the window; row ``seq_length-1`` is the **last**
+    bar before the label (same stacking as NumPy ``(L, F)``.reshape(-1)).
+    """
+    flat_scores = np.asarray(flat_scores, dtype=float).ravel()
+    nfeat = len(feature_names)
+    if flat_scores.size != seq_length * nfeat:
+        raise ValueError(
+            f"flat size {flat_scores.size} != seq_length * n_features "
+            f"({seq_length} * {nfeat})"
+        )
+    arr = flat_scores.reshape(seq_length, nfeat)
+    ix = pd.Index(range(seq_length), name="timestep_in_window")
+    return pd.DataFrame(arr, index=ix, columns=list(feature_names))
+
+
+def plot_window_flat_scores(
+    panels: dict[str, np.ndarray],
+    seq_length: int,
+    feature_names,
+    *,
+    zlabel: str = "score",
+    suptitle: str | None = None,
+    cmap: str = "magma",
+    share_scale: bool = True,
+    show: bool = True,
+):
+    """Heatmaps of per-(timestep x channel) scores, e.g. mutual information per flattened column."""
+    names = tuple(feature_names)
+    grids = {}
+    vmin, vmax = None, None
+    for key, flat in panels.items():
+        grids[key] = window_scores_flat_to_grid(flat, seq_length, names)
+        g = grids[key].to_numpy(dtype=float)
+        finite = np.isfinite(g)
+        if finite.any():
+            lo, hi = float(np.nanmin(g[finite])), float(np.nanmax(g[finite]))
+            vmin = lo if vmin is None else min(vmin, lo)
+            vmax = hi if vmax is None else max(vmax, hi)
+
+    n_p = len(panels)
+    ncols = min(2, n_p)
+    nrows = int(np.ceil(n_p / ncols))
+    fig_w = max(11.0, 2.8 * ncols + 2.5)
+    fig_h = max(4.8, 3.2 * nrows + 1.5)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(fig_w, fig_h),
+        squeeze=False,
+    )
+    if not share_scale:
+        vmin, vmax = None, None
+
+    for ax, (title, _) in zip(axes.ravel(), panels.items()):
+        grid = grids[title].to_numpy(dtype=float)
+        im_kw = dict(
+            aspect="auto",
+            cmap=cmap,
+            origin="upper",
+            interpolation="nearest",
+        )
+        if vmin is not None and vmax is not None and vmin < vmax:
+            im_kw["vmin"], im_kw["vmax"] = vmin, vmax
+        im = ax.imshow(grid, **im_kw)
+        ax.set_title(title)
+        ax.set_xticks(np.arange(grid.shape[1]))
+        ax.set_xticklabels(list(names), rotation=55, ha="right", fontsize=8)
+        ax.set_yticks(np.arange(seq_length))
+        ax.set_yticklabels(
+            [
+                (
+                    "oldest"
+                    if i == 0
+                    else ("newest (= t-1)" if i == seq_length - 1 else str(i))
+                )
+                for i in range(seq_length)
+            ],
+            fontsize=8,
+        )
+        ax.set_xlabel("input channel")
+        ax.set_ylabel("position in seq window")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label=zlabel)
+
+    for ax in axes.ravel()[len(panels) :]:
+        ax.set_visible(False)
+
+    if suptitle:
+        fig.suptitle(suptitle, y=1.02, fontsize=12)
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, axes, grids
 
 
 def plot_permutation_feature_importance(
