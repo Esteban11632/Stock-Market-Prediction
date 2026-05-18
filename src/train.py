@@ -13,7 +13,7 @@ import torch.nn as nn
 import utils
 from joblib import dump
 from config import get_config
-import shap
+import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -175,8 +175,29 @@ feature_importance = utils.permutation_feature_importance_mse(
 print(feature_importance)
 utils.plot_permutation_feature_importance(feature_importance)
 
-# SHAP
+for output_index in range(nf_out):
 
+    print(
+        f"\nOutput index: {output_index} "
+        f"({full_ds.target_column_names[output_index]})"
+    )
+
+    shap_values, _shap_samples = utils.get_shap_values(
+        model,
+        X_train_scaled,
+        X_test_scaled,
+        device,
+        background_size=96,
+        sample_size=24,
+        output_index=output_index,
+    )
+
+    sv = shap_values[..., 0]
+
+    utils.shap_time_heatmap(
+        full_ds.input_feature_names,
+        sv
+    )
 
 # Save the model and scalers
 directory = Path(__file__).resolve().parent.parent

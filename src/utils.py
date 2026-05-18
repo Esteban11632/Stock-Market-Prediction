@@ -3,7 +3,6 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import root_mean_squared_error
-import shap
 
 def get_column_normalized_to_1d(df, column_name):
     column = df[column_name].squeeze()
@@ -22,19 +21,99 @@ def predict_loader(model, loader, device):
     return torch.cat(preds, dim=0), torch.cat(ys, dim=0)
 
 
-def get_shap_values(model, X, device, background_size=100, sample_size=50):
-    model.eval()
+def get_shap_values(
+    model,
+    X_train,
+    X_test,
+    device,
+    background_size=96,
+    sample_size=24,
+    output_index=None,
+):
+    """SHAP GradientExplainer on subsets of scaled ``(B, L, F)`` windows.
 
-    background_size = min(background_size, len(X))
-    sample_size = min(sample_size, len(X))
+    ``shap`` is imported lazily (avoids numba/llvmlite at ``import utils``).
 
-    background = torch.from_numpy(X[:background_size]).float().to(device)
-    samples = torch.from_numpy(X[:sample_size]).float().to(device)
+    CUDA + cuDNN LSTM requires **training mode** during ``shap_values`` backward;
+    we set ``.train()`` only for that call, then restore prior mode.
 
-    explainer = shap.GradientExplainer(model, background)
-    shap_values = explainer.shap_values(samples)
+    ``output_index``: if set, explains ``model(x)[:, output_index]`` only.
+    """
+    import shap
 
-    return shap_values, samples
+    prev_mode = model.training
+    device = torch.device(device) if isinstance(device, str) else device
+
+    X_train = np.asarray(X_train, dtype=np.float32)
+    X_test = np.asarray(X_test, dtype=np.float32)
+    bg_n = max(8, min(int(background_size), len(X_train)))
+    ex_n = max(1, min(int(sample_size), len(X_test)))
+
+    bg = torch.from_numpy(X_train[:bg_n]).to(device)
+    smpl = torch.from_numpy(X_test[:ex_n]).to(device)
+
+    if output_index is not None:
+        j = int(output_index)
+
+        class _PickOutput(torch.nn.Module):
+            def __init__(self, m, idx):
+                super().__init__()
+                self.m = m
+                self.idx = idx
+
+            def forward(self, x):
+                return self.m(x)[:, self.idx : self.idx + 1]
+
+        target_model = _PickOutput(model, j).to(device)
+    else:
+        target_model = model.to(device)
+
+    explainer = shap.GradientExplainer(target_model, bg)
+
+    target_model.train()
+    try:
+        shap_values = explainer.shap_values(smpl)
+    finally:
+        target_model.train(prev_mode)
+
+    return shap_values, smpl
+
+
+def shap_time_heatmap(feature_names, sv):
+    """
+    sv shape:
+    (samples, seq_length, features)
+    """
+
+    feature_day_importance = np.abs(sv).mean(axis=0)
+
+    plt.figure(figsize=(10, 6))
+
+    plt.imshow(
+        feature_day_importance.T,
+        aspect="auto"
+    )
+
+    plt.colorbar(label="Mean |SHAP value|")
+
+    plt.xlabel("Day in window")
+    plt.ylabel("Feature")
+
+    plt.yticks(
+        range(len(feature_names)),
+        feature_names
+    )
+
+    seq_length = feature_day_importance.shape[0]
+
+    plt.xticks(
+        range(seq_length),
+        [f"t-{seq_length-1-i}" for i in range(seq_length)]
+    )
+
+    plt.title("SHAP Feature Importance Across Time")
+
+    plt.show()
 
 def predict_numpy_batches(model, X_np, device, batch_size=512):
     """Run inference on `(N, T, F)` float array; returns `(N, n_out)` on CPU numpy."""
