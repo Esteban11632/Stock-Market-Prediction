@@ -18,8 +18,11 @@ class StockMarketDataset(Dataset):
     Use ``input_feature_names`` / ``target_column_names`` for labels aligned with tensor columns.
     """
 
-    def __init__(self, df, seq_length):
+    def __init__(self, df, seq_length=5, stride=1):
         super().__init__()
+
+        self.stride = stride
+
         close = df["Close"].squeeze()
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
@@ -43,10 +46,22 @@ class StockMarketDataset(Dataset):
         self.seq_length = seq_length
 
         close_f = close.astype(np.float64)
-        returns_s = (
+        open_f = open_.astype(np.float64)
+        high_f = high.astype(np.float64)
+        low_f = low.astype(np.float64)
+        returns_close = (
             np.log(close_f).diff().replace([np.inf, -np.inf], np.nan).dropna()
         )
-        idx = returns_s.index
+        returns_open = (
+            np.log(open_f).diff().replace([np.inf, -np.inf], np.nan).dropna()
+        )
+        returns_high = (
+            np.log(high_f).diff().replace([np.inf, -np.inf], np.nan).dropna()
+        )
+        returns_low = (
+            np.log(low_f).diff().replace([np.inf, -np.inf], np.nan).dropna()
+        )
+        idx = returns_close.index
         body = (close - open_).reindex(idx)
         range_ = (high - low).reindex(idx)
         vol_chg = (
@@ -56,7 +71,10 @@ class StockMarketDataset(Dataset):
             .reindex(idx)
         )
         close_pos = ((close - open_) / (high - low)).reindex(idx)
-        self.returns = returns_s
+        self.returns = returns_close
+        self.returns_open = returns_open
+        self.returns_high = returns_high
+        self.returns_low = returns_low
         self.body = body
         self.range = range_
         self.vol_chg = vol_chg
@@ -71,7 +89,7 @@ class StockMarketDataset(Dataset):
         )
         self._fwd_horizon_max = max(h for _, h in self._fwd_target_specs)
         _fwd_totals = StockMarketDataset.forward_cumulative_log_returns_from_here(
-            returns_s,
+            returns_close,
             tuple(h for _, h in self._fwd_target_specs),
         )
         self.cols_y = [_fwd_totals[h] for _, h in self._fwd_target_specs]
@@ -84,6 +102,9 @@ class StockMarketDataset(Dataset):
         self.moving_average_5 = self.get_moving_average(5, close).reindex(idx)
         self.moving_average_10 = self.get_moving_average(10, close).reindex(idx)
         self.moving_average_20 = self.get_moving_average(20, close).reindex(idx)
+        self.exponential_moving_average_5 = self.get_exponential_moving_average(5, close).reindex(idx)
+        self.exponential_moving_average_10 = self.get_exponential_moving_average(10, close).reindex(idx)
+        self.exponential_moving_average_20 = self.get_exponential_moving_average(20, close).reindex(idx)
 
         # Rolling volatility
         self.rolling_volatility_5 = self.returns.rolling(window=5, min_periods=5).std()
@@ -100,21 +121,53 @@ class StockMarketDataset(Dataset):
         self.bollinger_bands_20_lower = (
             self.bollinger_bands_20 - 2 * self.bollinger_bands_20_std
         )
+
+        # RSI
+        self.rsi_14 = self.get_rsi(close, 14).reindex(idx)
+        self.rsi_20 = self.get_rsi(close, 20).reindex(idx)
+        self.rsi_30 = self.get_rsi(close, 30).reindex(idx)
+
+        # MACD (tuple of Series — reindex each to returns timeline idx)
+        self.macd, self.macd_signal, self.macd_hist = (
+            s.reindex(idx) for s in self.get_macd(close)
+        )
+
+        # Momentum
+        self.momentum_5d = self.get_momentum(close, 5).reindex(idx)
+        self.momentum_20d = self.get_momentum(close, 20).reindex(idx)
+
+        # Overnight gap: today's open minus prior session's close (aligned to returns idx).
+        self.overnight_gap = (open_ - close.shift(1)).reindex(idx)
         
         _x_extra_specs = (
             ("returns", self.returns),
+            ("returns_open", self.returns_open),
+            ("returns_high", self.returns_high),
+            ("returns_low", self.returns_low),
             ("body", self.body),
             ("range", self.range),
             ("vol_chg", self.vol_chg),
             ("close_pos", self.close_pos),
-            ("ma_5", self.moving_average_5),
+            #("ma_5", self.moving_average_5),
             #("ma_10", self.moving_average_10),
             #("ma_20", self.moving_average_20),
+            #("ema_5", self.exponential_moving_average_5),
+            #("ema_10", self.exponential_moving_average_10),
+            ("ema_20", self.exponential_moving_average_20),
             ("roll_vol_5", self.rolling_volatility_5),
             ("roll_vol_10", self.rolling_volatility_10),
             #("bb_mid", self.bollinger_bands_20),
             #("bb_upper", self.bollinger_bands_20_upper),
             #("bb_lower", self.bollinger_bands_20_lower),
+            ("rsi_14", self.rsi_14),
+            #("rsi_20", self.rsi_20),
+            #("rsi_30", self.rsi_30),
+            ("macd", self.macd),
+            ("macd_signal", self.macd_signal),
+            ("macd_hist", self.macd_hist),
+            #("momentum_5d", self.momentum_5d),
+            #("momentum_20d", self.momentum_20d),
+            #("overnight_gap", self.overnight_gap),
         )
         self.cols_x = [series for _, series in _x_extra_specs]
         self.input_feature_names = tuple(
@@ -142,7 +195,7 @@ class StockMarketDataset(Dataset):
                 "Not enough rows after warmup / forward horizons for seq_length; "
                 "increase history, shorten horizons, or reduce seq_length / warmup."
             )
-        return usable
+        return usable // self.stride
 
     @staticmethod
     def forward_cumulative_log_returns_from_here(daily_log_returns: pd.Series, horizons: tuple[int, ...]):
@@ -174,6 +227,60 @@ class StockMarketDataset(Dataset):
     def get_moving_average(self, window_size, col):
         return col.rolling(window=window_size, min_periods=window_size).mean()
 
+    def get_exponential_moving_average(self, span, col):
+        """EMA on raw ``col`` (e.g. close), not on the SMA. Uses ``span=N`` (same N as MA window)."""
+        return col.ewm(span=int(span), min_periods=int(span), adjust=False).mean()
+
+    def get_rsi(self, close, period=14):
+        delta = close.diff()
+
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        avg_gain = gain.ewm(
+            alpha=1/period,
+            min_periods=period,
+            adjust=False
+        ).mean()
+
+        avg_loss = loss.ewm(
+            alpha=1/period,
+            min_periods=period,
+            adjust=False
+        ).mean()
+
+        rs = avg_gain / avg_loss
+
+        rsi = 100 - (100 / (1 + rs))
+
+        return rsi
+
+    def get_macd(self, close, fast=12, slow=26, signal=9):
+
+        ema_fast = close.ewm(
+            span=fast,
+            adjust=False
+        ).mean()
+
+        ema_slow = close.ewm(
+            span=slow,
+            adjust=False
+        ).mean()
+
+        macd = ema_fast - ema_slow
+
+        macd_signal = macd.ewm(
+            span=signal,
+            adjust=False
+        ).mean()
+
+        macd_hist = macd - macd_signal
+
+        return macd, macd_signal, macd_hist
+
+    def get_momentum(self, close, period):
+        return close.pct_change(period)
+
     def as_numpy(self):
         """Stack all windows into arrays for scaling / train_test_split.
 
@@ -188,7 +295,7 @@ class StockMarketDataset(Dataset):
         return X, y
 
     def __getitem__(self, idx):
-        base = idx + self._warmup
+        base = self._warmup + idx * self.stride
 
         # Get the window of features
         X = np.stack(

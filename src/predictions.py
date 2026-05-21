@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from pathlib import Path
 from sklearn.metrics import root_mean_squared_error
@@ -56,14 +57,36 @@ y_pred_scaled, y_true_scaled = utils.predict_loader(model, test_loader, device)
 y_pred = scaler_y.inverse_transform(y_pred_scaled.numpy())
 y_true = scaler_y.inverse_transform(y_true_scaled.numpy())
 # Column 0 = daily log return (H=1 cumulative log); price: prev_close * exp(pred).
-_rmse_ret = root_mean_squared_error(y_true[:, 0], y_pred[:, 0])
-print(f"RMSE (scaled target col0 — 1-day cumulative log return): {_rmse_ret:.6f}")
+_rmse_ret = root_mean_squared_error(y_true, y_pred)
+print(f"RMSE (scaled target log returns): {_rmse_ret:.6f}")
 indices = list(range(0, len(X_scaled)))
-pred_prices, actual_prices, test_dates = utils.predicted_returns_to_prices(
-    df, full_ds, indices, seq_length, y_pred
+price_paths = utils.predicted_returns_to_prices(
+    df,
+    full_ds,
+    indices,
+    seq_length,
+    y_pred,
+    actual_returns=y_true,
+    return_all_horizons=True,
 )
+pred_all = price_paths["pred_terminal_price"]
+actual_all = price_paths["actual_terminal_price"]
+pred_prices = pred_all[:, 0]
+actual_prices = actual_all[:, 0]
+test_dates = price_paths["anchor_dates"]
 _rmse_price = root_mean_squared_error(actual_prices, pred_prices)
-print(f"RMSE (price, one-step next-bar): {_rmse_price:.4f}")
+
+# Pooled RMSE over all heads: same units as terminal close (flatten N × n_horizons).
+_pred_flat = pred_all.ravel()
+_actual_flat = actual_all.ravel()
+_ok = np.isfinite(_pred_flat) & np.isfinite(_actual_flat)
+_rmse_price_all_horizons = root_mean_squared_error(
+    _actual_flat[_ok],
+    _pred_flat[_ok],
+)
+print(
+    f"RMSE (price, pooled {nf_out} targets): {_rmse_price_all_horizons:.4f}"
+)
 
 k_last = indices[-1]
 forward_forecast = None
@@ -85,3 +108,6 @@ utils.graph_predictions(
     test_rmse_price=_rmse_price,
     forward_forecast=forward_forecast,
 )
+
+# Long horizons vs settlement date (1w / 1m / 3m); overlaps aggregated per day (median).
+utils.graph_predictions_horizons(ticker, price_paths)

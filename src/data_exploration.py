@@ -256,6 +256,12 @@ if getattr(ds, "bollinger_bands_20", None) is not None:
     fig_bbs.tight_layout()
     plt.show()
 
+# --- RSI(14): same as ``StockMarketDataset.rsi_14`` / ``get_rsi`` in data_pipeline ---
+rsi_series = getattr(ds, "rsi_14", None)
+if rsi_series is not None:
+    close_align = ohlcv["Close"].astype(float).reindex(t)
+    sm_utils.plot_close_and_rsi(t, close_align, rsi_series, ticker)
+
 # Mutual information (whole window flattened → one MI score per timestep × channel)
 seq_length = [5, 10, 20]
 for seq_len in seq_length:

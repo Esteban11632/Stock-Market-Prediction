@@ -49,8 +49,8 @@ def get_shap_values(
     bg_n = max(8, min(int(background_size), len(X_train)))
     ex_n = max(1, min(int(sample_size), len(X_test)))
 
-    bg = torch.from_numpy(X_train[:bg_n]).to(device)
-    smpl = torch.from_numpy(X_test[:ex_n]).to(device)
+    background = torch.from_numpy(X_train[:bg_n]).to(device)
+    samples = torch.from_numpy(X_test[:ex_n]).to(device)
 
     if output_index is not None:
         j = int(output_index)
@@ -68,18 +68,18 @@ def get_shap_values(
     else:
         target_model = model.to(device)
 
-    explainer = shap.GradientExplainer(target_model, bg)
+    explainer = shap.GradientExplainer(target_model, background)
 
     target_model.train()
     try:
-        shap_values = explainer.shap_values(smpl)
+        shap_values = explainer.shap_values(samples)
     finally:
         target_model.train(prev_mode)
 
-    return shap_values, smpl
+    return shap_values, samples
 
 
-def shap_time_heatmap(feature_names, sv):
+def shap_time_heatmap(name, feature_names, sv):
     """
     sv shape:
     (samples, seq_length, features)
@@ -111,7 +111,7 @@ def shap_time_heatmap(feature_names, sv):
         [f"t-{seq_length-1-i}" for i in range(seq_length)]
     )
 
-    plt.title("SHAP Feature Importance Across Time")
+    plt.title(f"{name} SHAP Feature Importance Across Time")
 
     plt.show()
 
@@ -217,6 +217,62 @@ def window_scores_flat_to_grid(
     arr = flat_scores.reshape(seq_length, nfeat)
     ix = pd.Index(range(seq_length), name="timestep_in_window")
     return pd.DataFrame(arr, index=ix, columns=list(feature_names))
+
+
+def plot_close_and_rsi(
+    dates: pd.DatetimeIndex | pd.Index,
+    close: pd.Series,
+    rsi: pd.Series,
+    ticker: str,
+    *,
+    period_label: str = "14",
+    figsize: tuple[float, float] = (12, 5.5),
+    show: bool = True,
+):
+    """Plot close (top) and RSI (bottom), aligned on ``dates``.
+
+    RSI is expected to match ``data_pipeline.get_rsi`` / ``StockMarketDataset.rsi_*``.
+    Draws heuristic 30/70 reference bands (not trading advice).
+    """
+    fig, (ax_price, ax_rsi) = plt.subplots(
+        2,
+        1,
+        figsize=figsize,
+        sharex=True,
+        height_ratios=[1.25, 1],
+    )
+    ax_price.plot(
+        dates, close, color="black", linewidth=0.85, alpha=0.92, label="close"
+    )
+    ax_price.set_ylabel("price (USD)")
+    ax_price.set_title(
+        f"{ticker} — close (top) and RSI({period_label}) (bottom, data_pipeline definition)"
+    )
+    ax_price.legend(loc="upper left", fontsize=8)
+    ax_price.grid(True, alpha=0.3)
+
+    ax_rsi.plot(
+        dates,
+        rsi,
+        color="tab:purple",
+        linewidth=0.9,
+        label=f"RSI({period_label})",
+    )
+    ax_rsi.axhline(70, color="tab:red", linestyle="--", linewidth=0.7, alpha=0.85)
+    ax_rsi.axhline(30, color="tab:green", linestyle="--", linewidth=0.7, alpha=0.85)
+    ax_rsi.axhline(50, color="gray", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax_rsi.set_ylim(0, 100)
+    ax_rsi.set_ylabel(f"RSI({period_label})")
+    ax_rsi.set_xlabel("Date")
+    ax_rsi.set_title(
+        "Heuristic reference: 30 / 70 bands (not a trading recommendation)"
+    )
+    ax_rsi.legend(loc="upper left", fontsize=8)
+    ax_rsi.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, (ax_price, ax_rsi)
 
 
 def plot_window_flat_scores(
@@ -334,32 +390,181 @@ def plot_permutation_feature_importance(
         plt.show()
     return fig, ax
 
-def predicted_returns_to_prices(df, full_ds, test_indices, seq_length, pred_returns):
-    """Map predicted **daily log return** (column 0) to next close: ``prev * exp(pred)``."""
-    pred_ret_flat = np.asarray(pred_returns[:, 0]).ravel()
-    assert len(pred_ret_flat) == len(test_indices)
+def predicted_returns_to_prices(
+    df,
+    full_ds,
+    test_indices,
+    seq_length,
+    pred_returns,
+    *,
+    actual_returns=None,
+    return_all_horizons: bool = False,
+):
+    """Map cumulative log-return predictions to terminal closes ``prev_close * exp(cum_log)``.
 
-    pred_prices = []
-    actual_prices = []
-    test_dates = []
+    Default (``return_all_horizons=False``): **column 0 only** vs actual close at anchor
+    ``r.index[p]`` — same triple as legacy code.
 
-    close = get_column_normalized_to_1d(df, "Close")
+    ``return_all_horizons=True``: return a dict with **all heads** \(N × n_outputs\) plus
+    calendar **terminal_dates** rows. Prefer ``actual_returns=y_true`` so actuals match
+    targets exactly; otherwise OHLC at ``p+H-1`` fills actuals.
+    """
+    close_ser = get_column_normalized_to_1d(df, "Close")
+    r_ix = full_ds.returns.index
 
-    r = full_ds.returns
+    preds = np.asarray(pred_returns, dtype=np.float64)
+    if preds.ndim == 1:
+        preds = preds.reshape(-1, 1)
 
-    # Align rows with test_loader order: sample j corresponds to dataset index test_indices[j].
-    for j, k in enumerate(test_indices):
-        p = k + full_ds._warmup + seq_length
-        prev_c = float(close.loc[r.index[p - 1]])
-        pred_prices.append(prev_c * float(np.exp(pred_ret_flat[j])))
-        actual_prices.append(float(close.loc[r.index[p]]))
-        test_dates.append(r.index[p])
+    horizons = tuple(h for _, h in full_ds._fwd_target_specs)
+    nheads = len(horizons)
+    if preds.shape[1] != nheads:
+        raise ValueError(
+            f"pred_returns has shape {preds.shape}; expected (N, {nheads}) for "
+            f"{list(full_ds.target_column_names)}"
+        )
 
-    pred_prices = np.array(pred_prices)
-    actual_prices = np.array(actual_prices)
-    test_dates = pd.DatetimeIndex(test_dates)
+    test_indices_u = np.asarray(list(test_indices))
+    if test_indices_u.shape[0] != preds.shape[0]:
+        raise ValueError(
+            f"len(test_indices)={test_indices_u.shape[0]} != pred rows={preds.shape[0]}"
+        )
 
-    return pred_prices, actual_prices, test_dates
+    n_samples = preds.shape[0]
+    nj = preds.shape[1]
+    prev_c_arr = np.empty(n_samples, dtype=np.float64)
+    anchor_dates = []
+    p_list = []
+
+    for _row, k in enumerate(test_indices_u.astype(int)):
+        p = int(k) + int(full_ds._warmup) + int(seq_length)
+        if p <= 0 or p >= len(r_ix):
+            raise IndexError(
+                f"anchor index p={p} out of bounds for returns index len={len(r_ix)}"
+            )
+        p_list.append(p)
+        prev_c_arr[_row] = float(close_ser.loc[r_ix[p - 1]])
+        anchor_dates.append(r_ix[p])
+
+    pred_terminal = prev_c_arr[:, np.newaxis] * np.exp(preds)
+
+    if actual_returns is not None:
+        act = np.asarray(actual_returns, dtype=np.float64)
+        if act.ndim == 1:
+            act = act.reshape(-1, 1)
+        if act.shape != preds.shape:
+            raise ValueError(
+                f"actual_returns shape {act.shape} must match pred_returns {preds.shape}"
+            )
+        actual_terminal = prev_c_arr[:, np.newaxis] * np.exp(act)
+    else:
+        actual_terminal = np.full((n_samples, nj), np.nan, dtype=np.float64)
+        for row, p in enumerate(p_list):
+            for jh, H in enumerate(horizons):
+                end_p = p + H - 1
+                if 0 <= end_p < len(r_ix):
+                    actual_terminal[row, jh] = float(close_ser.loc[r_ix[end_p]])
+
+    anchor_ix = pd.DatetimeIndex(anchor_dates)
+
+    if return_all_horizons:
+        offs = tuple(h - 1 for h in horizons)
+        rows_td = []
+        for p in p_list:
+            rows_td.append(
+                [
+                    r_ix[p + off] if 0 <= p + off < len(r_ix) else pd.NaT
+                    for off in offs
+                ]
+            )
+        return {
+            "pred_terminal_price": pred_terminal,
+            "actual_terminal_price": actual_terminal,
+            "anchor_dates": anchor_ix,
+            "terminal_dates": pd.DataFrame(
+                rows_td,
+                columns=list(full_ds.target_column_names),
+                index=anchor_ix,
+            ),
+            "target_column_names": tuple(full_ds.target_column_names),
+            "prev_close": prev_c_arr,
+        }
+
+    return pred_terminal[:, 0], actual_terminal[:, 0], anchor_ix
+
+
+def graph_predictions_horizons(
+    ticker: str,
+    paths: dict,
+    *,
+    horizons_to_plot: tuple[str, ...] = (
+        "fwd_tot_1w",
+        "fwd_tot_1m",
+        "fwd_tot_3m",
+    ),
+    aggregate_duplicate_dates: str = "median",
+    show=True,
+):
+    """Pred vs realized **terminal closes** per long horizon vs **terminal settlement date**.
+
+    ``paths``: output of ``predicted_returns_to_prices(..., return_all_horizons=True,
+    actual_returns=y_true)``. Overlapping windows share the same settlement day; duplicates
+    are aggregated with ``median`` / ``mean`` / ``first`` via ``aggregate_duplicate_dates``.
+    """
+    cols = tuple(paths["target_column_names"])
+    P = paths["pred_terminal_price"]
+    A = paths["actual_terminal_price"]
+    term = paths["terminal_dates"]
+
+    fig, axes = plt.subplots(len(horizons_to_plot), 1, figsize=(11, 3.8 * len(horizons_to_plot)), sharex=True)
+    if len(horizons_to_plot) == 1:
+        axes = np.array([axes])
+
+    for ax, hname in zip(axes.flat, horizons_to_plot):
+        if hname not in cols:
+            raise ValueError(f"Unknown horizon {hname!r}; dataset has {cols}")
+        j = cols.index(hname)
+
+        td = pd.to_datetime(term[hname])
+        df_h = pd.DataFrame(
+            {"dt": td, "pred": P[:, j], "actual": A[:, j]}
+        ).replace([np.inf, -np.inf], np.nan).dropna(subset=["pred", "actual"])
+        df_h["dt"] = pd.to_datetime(df_h["dt"])
+        df_h = df_h[np.isfinite(df_h["pred"].to_numpy(dtype=float))]
+        df_h = df_h[np.isfinite(df_h["actual"].to_numpy(dtype=float))]
+        if df_h.empty:
+            ax.text(0.5, 0.5, f"No finite rows for {hname}", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        if aggregate_duplicate_dates not in {"median", "mean", "first"}:
+            raise ValueError("aggregate_duplicate_dates must be median, mean, or first")
+        g = df_h.groupby("dt", sort=False)
+        if aggregate_duplicate_dates == "median":
+            d_sorted = g[["pred", "actual"]].median()
+        elif aggregate_duplicate_dates == "mean":
+            d_sorted = g[["pred", "actual"]].mean()
+        else:
+            d_sorted = g[["pred", "actual"]].first()
+        d_sorted = d_sorted.sort_index()
+
+        rmse_h = root_mean_squared_error(d_sorted["actual"], d_sorted["pred"])
+        ax.plot(d_sorted.index, d_sorted["actual"], color="navy", label="Realized terminal close", lw=1.1)
+        ax.plot(d_sorted.index, d_sorted["pred"], color="darkgreen", label="Predicted terminal close", lw=1.1)
+        ax.set_ylabel(f"Price ({hname})")
+        ax.set_title(f"{ticker} — {hname} (RMSE price ≈ {rmse_h:.4f}; dates = settlement)")
+        ax.grid(True, alpha=0.35)
+        ax.legend(loc="best", fontsize=8)
+
+    axes[-1].set_xlabel("Settlement date")
+    plt.suptitle(
+        f"{ticker}: long-horizon terminal closes (overlap windows → {aggregate_duplicate_dates} per day)",
+        y=1.008,
+        fontsize=11,
+    )
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, axes
 
 
 def _cumulative_log_targets_to_terminal_closes(prev_close: float, cumulative_log_row):
@@ -413,7 +618,6 @@ def graph_predictions(
     pred_prices = np.asarray(pred_prices, dtype=np.float64).ravel()
     if test_rmse_price is None:
         test_rmse_price = root_mean_squared_error(actual_prices, pred_prices)
-        print(f"RMSE (price, one-step next-bar): {test_rmse_price:.4f}")
 
     fig = plt.figure(figsize=(10, 8))
     gs = fig.add_gridspec(4, 1)
@@ -461,7 +665,7 @@ def graph_predictions(
         ax1.axvline(fd[0], color="gray", linestyle=":", linewidth=1, alpha=0.8)
         title = f"{ticker} — close + horizon price forecast (last sample)"
 
-    ax1.set_title(title)
+    ax1.set_title(f"{title}\nRMSE (one-step price): {test_rmse_price:.4f}", fontsize=11)
     ax1.set_xlabel("Date")
     ax1.set_ylabel("Price")
     ax1.grid(True)

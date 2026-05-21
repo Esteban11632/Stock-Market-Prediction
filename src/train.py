@@ -23,7 +23,7 @@ seq_length = config["seq_length"]
 
 df = yf.download(ticker, start="2000-01-01", end="2023-12-31")
 
-full_ds = StockMarketDataset(df, seq_length)
+full_ds = StockMarketDataset(df, seq_length, stride=seq_length)
 X_train, X_val, X_test, y_train, y_val, y_test = split_data(full_ds)
 
 start_test = len(X_train) + len(X_val)
@@ -164,6 +164,7 @@ print(
 )
 print(f"Train RMSE (1-day cumulative log return): {train_rmse_ret:.6f} | Test: {test_rmse_ret:.6f}")
 
+# Permutation feature importance
 feature_importance = utils.permutation_feature_importance_mse(
     model,
     X_test_scaled,
@@ -175,14 +176,15 @@ feature_importance = utils.permutation_feature_importance_mse(
 print(feature_importance)
 utils.plot_permutation_feature_importance(feature_importance)
 
-for output_index in range(nf_out):
+# SHAP values for each output
+for output_index, name in enumerate(full_ds.target_column_names):
 
     print(
         f"\nOutput index: {output_index} "
-        f"({full_ds.target_column_names[output_index]})"
+        f"({name}) SHAP values"
     )
 
-    shap_values, _shap_samples = utils.get_shap_values(
+    shap_values, shap_samples = utils.get_shap_values(
         model,
         X_train_scaled,
         X_test_scaled,
@@ -195,6 +197,7 @@ for output_index in range(nf_out):
     sv = shap_values[..., 0]
 
     utils.shap_time_heatmap(
+        name,
         full_ds.input_feature_names,
         sv
     )

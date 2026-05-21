@@ -18,11 +18,17 @@ class AdditiveAttentionPooling(nn.Module):
         self.score = nn.Linear(hidden_dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, L, H)
+        # x: (Batch, Sequence Length, Hidden Dimension)
         u = torch.tanh(self.proj(x))
-        scores = self.score(u).squeeze(-1)  # (B, L)
+
+        # How important is each time step?
+        scores = self.score(u).squeeze(-1)  # (Batch, Sequence Length)
+
+        # Distribution over which steps steps matter
         weights = torch.softmax(scores, dim=-1)
-        ctx = (x * weights.unsqueeze(-1)).sum(dim=1)  # (B, H)
+
+        # Sum the weighted contributions of each time step
+        ctx = (x * weights.unsqueeze(-1)).sum(dim=1)  # (Batch, Hidden Dimension)
         return ctx
 
 
