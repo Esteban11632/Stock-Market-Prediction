@@ -1,46 +1,51 @@
 import numpy as np
 import torch
 from pathlib import Path
-from sklearn.metrics import root_mean_squared_error
 import yfinance as yf
 from torch.utils.data import DataLoader, TensorDataset
 from joblib import load
+import pandas as pd
+
 from cnn_lstm_attention import ConvLSTMAttentionStockModel
 from config import get_config
 from data_pipeline import StockMarketDataset
 import utils
 
+
 config = get_config()
+
 ticker = config["ticker"]
 seq_length = config["seq_length"]
+start_date = config["test_start_date"]
 
-df = yf.download(ticker, start="2024-01-01")
+df = yf.download(ticker, start=start_date)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
 directory = Path(__file__).resolve().parent.parent
 models_dir = directory / "models"
 scaler_dir = directory / "scalers"
-models_dir.mkdir(parents=True, exist_ok=True)
-scaler_dir.mkdir(parents=True, exist_ok=True)
 
 filename = "stock_market_model.pth"
+
 full_ds = StockMarketDataset(df, seq_length)
-X, y = full_ds.as_numpy()
+
+X, y, anchor_prices, target_start_positions = utils.as_numpy_all_x(full_ds, df)
 
 nf_in = X.shape[-1]
-nf_out = y.shape[-1]
+nf_out = len(full_ds.target_column_names)
+
+horizons = [1, 5, 20]
 
 scaler_X = load(scaler_dir / "scaler_X.joblib")
 scaler_y = load(scaler_dir / "scaler_y.joblib")
 
-X_scaled = scaler_X.transform(X.reshape(-1, nf_in)).reshape(X.shape).astype("float32")
-y_scaled = scaler_y.transform(y).astype("float32")
+X_scaled = scaler_X.transform(
+    X.reshape(-1, nf_in)
+).reshape(X.shape).astype("float32")
 
 test_loader = DataLoader(
-    TensorDataset(
-        torch.from_numpy(X_scaled),
-        torch.from_numpy(y_scaled),
-    ),
+    TensorDataset(torch.from_numpy(X_scaled)),
     batch_size=min(512, len(X_scaled)),
     shuffle=False,
 )
@@ -50,64 +55,87 @@ model = ConvLSTMAttentionStockModel(
     output_dim=nf_out,
     num_lstm_layers=config["num_lstm_layers"]
 ).to(device)
+
 state = torch.load(models_dir / filename, map_location=device)
 model.load_state_dict(state)
+model.eval()
 
-y_pred_scaled, y_true_scaled = utils.predict_loader(model, test_loader, device)
-y_pred = scaler_y.inverse_transform(y_pred_scaled.numpy())
-y_true = scaler_y.inverse_transform(y_true_scaled.numpy())
-# Column 0 = daily log return (H=1 cumulative log); price: prev_close * exp(pred).
-_rmse_ret = root_mean_squared_error(y_true, y_pred)
-print(f"RMSE (scaled target log returns): {_rmse_ret:.6f}")
-indices = list(range(0, len(X_scaled)))
-price_paths = utils.predicted_returns_to_prices(
-    df,
-    full_ds,
-    indices,
-    seq_length,
-    y_pred,
-    actual_returns=y_true,
-    return_all_horizons=True,
-)
-pred_all = price_paths["pred_terminal_price"]
-actual_all = price_paths["actual_terminal_price"]
-pred_prices = pred_all[:, 0]
-actual_prices = actual_all[:, 0]
-test_dates = price_paths["anchor_dates"]
-_rmse_price = root_mean_squared_error(actual_prices, pred_prices)
+preds_scaled = []
 
-# Pooled RMSE over all heads: same units as terminal close (flatten N × n_horizons).
-_pred_flat = pred_all.ravel()
-_actual_flat = actual_all.ravel()
-_ok = np.isfinite(_pred_flat) & np.isfinite(_actual_flat)
-_rmse_price_all_horizons = root_mean_squared_error(
-    _actual_flat[_ok],
-    _pred_flat[_ok],
-)
-print(
-    f"RMSE (price, pooled {nf_out} targets): {_rmse_price_all_horizons:.4f}"
+with torch.no_grad():
+    for (xb,) in test_loader:
+        xb = xb.to(device)
+        preds_scaled.append(model(xb).cpu())
+
+y_pred_scaled = torch.cat(preds_scaled, dim=0).numpy()
+y_pred = scaler_y.inverse_transform(y_pred_scaled)
+
+
+# Global RMSE across all targets
+valid_mask = ~np.isnan(y)
+
+rmse_log_returns_all = utils.get_rmse(
+    y[valid_mask],
+    y_pred[valid_mask]
 )
 
-k_last = indices[-1]
-forward_forecast = None
-try:
-    fd, pred_fc, real_fc = utils.forecast_price_path_from_last_sample(
-        df, full_ds, seq_length, k_last, y_pred[-1], y_true[-1]
+true_prices_all = np.full_like(y, np.nan, dtype=np.float64)
+predicted_prices_all = np.full_like(y_pred, np.nan, dtype=np.float64)
+
+for index, H in enumerate(horizons):
+    valid = ~np.isnan(y[:, index])
+
+    true_prices_all[valid, index] = utils.log_returns_to_terminal_prices(
+        anchor_prices[valid],
+        y[valid][:, [index]]
+    )[:, 0]
+
+    predicted_prices_all[valid, index] = utils.log_returns_to_terminal_prices(
+        anchor_prices[valid],
+        y_pred[valid][:, [index]]
+    )[:, 0]
+
+valid_price_mask = ~np.isnan(true_prices_all)
+
+rmse_prices_all = utils.get_rmse(
+    true_prices_all[valid_price_mask],
+    predicted_prices_all[valid_price_mask]
+)
+
+print(f"Global log-return RMSE: {rmse_log_returns_all:.6f}")
+print(f"Global terminal-price RMSE: {rmse_prices_all:.6f}")
+
+# Graphs
+for index, H in enumerate(horizons):
+
+    valid = ~np.isnan(y[:, index])
+
+    terminal_dates = df.index[
+        target_start_positions[valid] + H - 1
+    ]
+
+    true_prices_h = utils.log_returns_to_terminal_prices(
+        anchor_prices[valid],
+        y[valid][:, [index]]
     )
-    forward_forecast = {"forecast_dates": fd, "pred_closes": pred_fc}
-    if real_fc is not None:
-        forward_forecast["realized_closes"] = real_fc
-except ValueError as exc:
-    print(f"Skipping horizon price overlay: {exc}")
 
-utils.graph_predictions(
-    ticker,
-    test_dates,
-    actual_prices,
-    pred_prices,
-    test_rmse_price=_rmse_price,
-    forward_forecast=forward_forecast,
-)
+    predicted_prices_h = utils.log_returns_to_terminal_prices(
+        anchor_prices[valid],
+        y_pred[valid][:, [index]]
+    )
 
-# Long horizons vs settlement date (1w / 1m / 3m); overlaps aggregated per day (median).
-utils.graph_predictions_horizons(ticker, price_paths)
+    future_log_return = y_pred[-1, index]
+    future_anchor_price = anchor_prices[-1]
+    future_prediction = future_anchor_price * np.exp(future_log_return)
+
+    future_date = df.index[-1] + pd.tseries.offsets.BDay(H)
+
+    utils.plot_prediction_timeline(
+        terminal_dates,
+        true_prices_h,
+        predicted_prices_h,
+        [full_ds.target_column_names[index]],
+        output_index=0,
+        future_date=future_date,
+        future_prediction=future_prediction
+    )

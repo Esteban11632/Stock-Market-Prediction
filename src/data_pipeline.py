@@ -84,8 +84,7 @@ class StockMarketDataset(Dataset):
         self._fwd_target_specs = (
             ("fwd_tot_next_bar", 1),
             ("fwd_tot_1w", 5),
-            ("fwd_tot_1m", 20),
-            ("fwd_tot_3m", 60)
+            ("fwd_tot_1m", 20)
         )
         self._fwd_horizon_max = max(h for _, h in self._fwd_target_specs)
         _fwd_totals = StockMarketDataset.forward_cumulative_log_returns_from_here(

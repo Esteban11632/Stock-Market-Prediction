@@ -13,15 +13,16 @@ import torch.nn as nn
 import utils
 from joblib import dump
 from config import get_config
-import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 config = get_config()
 ticker = config["ticker"]
 seq_length = config["seq_length"]
+train_start_date = config["train_start_date"]
+train_end_date = config["train_end_date"]
 
-df = yf.download(ticker, start="2000-01-01", end="2023-12-31")
+df = yf.download(ticker, start=train_start_date, end=train_end_date)
 
 full_ds = StockMarketDataset(df, seq_length, stride=seq_length)
 X_train, X_val, X_test, y_train, y_val, y_test = split_data(full_ds)
