@@ -4,157 +4,302 @@ from sklearn.metrics import root_mean_squared_error
 import torch
 import torch.optim as optim
 from cnn_lstm_attention import ConvLSTMAttentionStockModel
-from transformer import StockTransformer
 from tqdm import tqdm
 from pathlib import Path
-from data_pipeline import StockMarketDataset, split_data
+from data_pipeline import StockMarketDataset
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import utils
 from joblib import dump
 from config import get_config
+from purgeKFold import PurgedKFoldCustom as PurgedKFold
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(42)
 
 config = get_config()
+
 ticker = config["ticker"]
 seq_length = config["seq_length"]
 train_start_date = config["train_start_date"]
 train_end_date = config["train_end_date"]
+batch_size = config["batch_size"]
+max_epochs = config["max_epochs"]
+patience = config["patience"]
 
-df = yf.download(ticker, start=train_start_date, end=train_end_date)
 
-full_ds = StockMarketDataset(df, seq_length, stride=seq_length)
-X_train, X_val, X_test, y_train, y_val, y_test = split_data(full_ds)
+def fit_scalers(X_train, y_train, nf_in):
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    scaler_X.fit(X_train.reshape(-1, nf_in))
+    scaler_y.fit(y_train)
+    return scaler_X, scaler_y
 
-start_test = len(X_train) + len(X_val)
-test_indices = list(range(start_test, start_test + len(X_test)))
 
-# Initialize scalers
-scaler_X = StandardScaler()
-scaler_y = StandardScaler()
+def scale_xy(scaler_X, scaler_y, X, y, nf_in):
+    X_scaled = scaler_X.transform(X.reshape(-1, nf_in)).reshape(X.shape)
+    y_scaled = scaler_y.transform(y)
+    return X_scaled, y_scaled
 
-nf_in = X_train.shape[-1]
-nf_out = y_train.shape[-1]
 
-# Reshape to (N, nf_in) for scaling
-scaler_X.fit(X_train.reshape(-1, nf_in))
-X_train_scaled = scaler_X.transform(X_train.reshape(-1, nf_in)).reshape(X_train.shape)
-X_val_scaled = scaler_X.transform(X_val.reshape(-1, nf_in)).reshape(X_val.shape)
-X_test_scaled = scaler_X.transform(X_test.reshape(-1, nf_in)).reshape(X_test.shape)
+def make_loaders(X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, batch_size):
+    train_ds = TensorDataset(
+        torch.from_numpy(X_train_scaled).float(),
+        torch.from_numpy(y_train_scaled).float(),
+    )
+    val_ds = TensorDataset(
+        torch.from_numpy(X_val_scaled).float(),
+        torch.from_numpy(y_val_scaled).float(),
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=min(512, len(val_ds)),
+        shuffle=False,
+        drop_last=False,
+    )
+    return train_loader, val_loader
 
-# Fit scaler on training targets
-scaler_y.fit(y_train)
-# Transform training, validation and test targets
-y_train_scaled = scaler_y.transform(y_train)
-y_val_scaled = scaler_y.transform(y_val)
-y_test_scaled = scaler_y.transform(y_test)
 
-# Convert to PyTorch tensors
-train_ds = TensorDataset(
-    torch.from_numpy(X_train_scaled).float(),
-    torch.from_numpy(y_train_scaled).float(),
+def make_train_loader(X_scaled, y_scaled, batch_size):
+    train_ds = TensorDataset(
+        torch.from_numpy(X_scaled).float(),
+        torch.from_numpy(y_scaled).float(),
+    )
+    return DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+
+
+def new_model(nf_in, nf_out, device):
+    return ConvLSTMAttentionStockModel(
+        input_dim=nf_in,
+        output_dim=nf_out,
+        num_lstm_layers=config["num_lstm_layers"],
+    ).to(device)
+
+
+def train_model_cv(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    nf_in,
+    nf_out,
+    device,
+    fold_label=None,
+):
+    """Train with early stopping; used inside PurgedKFold to pick best_epoch per fold."""
+    scaler_X, scaler_y = fit_scalers(X_train, y_train, nf_in)
+    X_train_scaled, y_train_scaled = scale_xy(scaler_X, scaler_y, X_train, y_train, nf_in)
+    X_val_scaled, y_val_scaled = scale_xy(scaler_X, scaler_y, X_val, y_val, nf_in)
+    train_loader, val_loader = make_loaders(
+        X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, batch_size
+    )
+
+    model = new_model(nf_in, nf_out, device)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
+
+    best_val = float("inf")
+    best_epoch = 1
+    epochs_no_improve = 0
+    best_state = None
+
+    desc = f"Training {fold_label}" if fold_label else "Training"
+    for epoch in tqdm(range(max_epochs), desc=desc):
+        model.train()
+        train_loss_sum = 0.0
+        n_elem_train = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            batch_elems = X_batch.size(0) * nf_out
+            train_loss_sum += loss.item() * batch_elems
+            n_elem_train += batch_elems
+        train_loss = train_loss_sum / max(n_elem_train, 1)
+
+        model.eval()
+        val_loss = utils.mse_mean_over_batches(val_loader, model, criterion, device, nf_out)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            epochs_no_improve = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+
+        if epoch % 25 == 0:
+            print(
+                f"Epoch {epoch + 1}/{max_epochs}, Train Loss: {train_loss:.4f}, "
+                f"Val Loss: {val_loss:.4f} (best: {best_val:.4f} @ epoch {best_epoch})"
+            )
+
+        if epochs_no_improve >= patience:
+            print(
+                f"Early stopping at epoch {epoch + 1} "
+                f"(no val improvement for {patience} epochs)."
+            )
+            break
+
+    return best_val, best_epoch
+
+
+def train_model_final(
+    X,
+    y,
+    num_epochs,
+    nf_in,
+    nf_out,
+    device,
+    scaler_X,
+    scaler_y,
+):
+    """Train on all trainval for a fixed number of epochs (from CV average)."""
+    X_scaled, y_scaled = scale_xy(scaler_X, scaler_y, X, y, nf_in)
+    train_loader = make_train_loader(X_scaled, y_scaled, batch_size)
+
+    model = new_model(nf_in, nf_out, device)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
+
+    for epoch in tqdm(range(num_epochs), desc=f"Final model ({num_epochs} epochs)"):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        if epoch % 25 == 0 or epoch == num_epochs - 1:
+            train_loss = utils.mse_mean_over_batches(
+                train_loader, model, criterion, device, nf_out
+            )
+            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}")
+
+    return model, X_scaled, y_scaled
+
+
+df = yf.download(
+    ticker,
+    start=train_start_date,
+    end=train_end_date,
 )
 
-val_ds = TensorDataset(
-    torch.from_numpy(X_val_scaled).float(),
-    torch.from_numpy(y_val_scaled).float(),
+full_ds = StockMarketDataset(
+    df,
+    seq_length,
 )
+
+samples_info_sets = full_ds.get_samples_info_sets()
+
+X, y = full_ds.as_numpy()
+
+n = len(X)
+test_size = int(0.10 * n)
+trainval_end = n - test_size
+
+X_trainval = X[:trainval_end]
+y_trainval = y[:trainval_end]
+
+X_test = X[trainval_end:]
+y_test = y[trainval_end:]
+
+samples_info_sets_trainval = samples_info_sets.iloc[:trainval_end]
+
+nf_in = X.shape[-1]
+nf_out = y.shape[-1]
+
+# ============================================================
+# Step 1: PurgedKFold — pick best_epoch per fold (leakage-safe validation)
+# ============================================================
+
+cv = PurgedKFold(
+    n_splits=5,
+    samples_info_sets=samples_info_sets_trainval,
+    pct_embargo=0.01,
+)
+
+fold_scores = []
+fold_best_epochs = []
+
+for fold, (train_idx, val_idx) in enumerate(cv.split(X_trainval)):
+    print(f"\n========== Fold {fold + 1} ==========")
+
+    best_val, best_epoch = train_model_cv(
+        X_trainval[train_idx],
+        y_trainval[train_idx],
+        X_trainval[val_idx],
+        y_trainval[val_idx],
+        nf_in,
+        nf_out,
+        device,
+        fold_label=f"fold {fold + 1}",
+    )
+    fold_scores.append(best_val)
+    fold_best_epochs.append(best_epoch)
+    print(f"Fold {fold + 1} best val loss: {best_val:.6f} @ epoch {best_epoch}")
+
+print("Fold scores:", fold_scores)
+print(f"Mean CV val loss: {sum(fold_scores) / len(fold_scores):.6f}")
+print(f"Best epochs per fold: {fold_best_epochs}")
+
+final_epochs = max(1, round(sum(fold_best_epochs) / len(fold_best_epochs)))
+print(f"Final training epochs (CV average): {final_epochs}")
+
+# ============================================================
+# Step 2: Retrain one model on ALL trainval for final_epochs
+# ============================================================
+
+print("\n========== Final model (100% trainval) ==========")
+
+scaler_X, scaler_y = fit_scalers(X_trainval, y_trainval, nf_in)
+
+model, X_trainval_scaled, y_trainval_scaled = train_model_final(
+    X_trainval,
+    y_trainval,
+    final_epochs,
+    nf_in,
+    nf_out,
+    device,
+    scaler_X,
+    scaler_y,
+)
+
+# ============================================================
+# Step 3: Evaluate on untouched 10% holdout test
+# ============================================================
+
+X_test_scaled, y_test_scaled = scale_xy(scaler_X, scaler_y, X_test, y_test, nf_in)
 
 test_ds = TensorDataset(
     torch.from_numpy(X_test_scaled).float(),
     torch.from_numpy(y_test_scaled).float(),
 )
+train_eval_ds = TensorDataset(
+    torch.from_numpy(X_trainval_scaled).float(),
+    torch.from_numpy(y_trainval_scaled).float(),
+)
 
-# Mini-batches add gradient noise and usually generalize better than full-batch GD.
-batch_size = min(256, max(32, len(train_ds) // 16))
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-val_loader = DataLoader(val_ds, batch_size=min(512, len(val_ds)), shuffle=False)
-test_loader = DataLoader(test_ds, batch_size=min(512, len(test_ds)), shuffle=False)
+test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+eval_train_loader = DataLoader(train_eval_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
-torch.manual_seed(42)
-
-def mse_mean_over_batches(loader, model, criterion, device, out_dim):
-    """MSELoss(reduction='mean') is over all elements; aggregate correctly across batches."""
-    total = 0.0
-    n_elem = 0
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-            loss = criterion(model(X_batch), y_batch)
-            batch_elems = X_batch.size(0) * out_dim
-            total += loss.item() * batch_elems
-            n_elem += batch_elems
-    return total / max(n_elem, 1)
-
-model = ConvLSTMAttentionStockModel(
-    input_dim=nf_in,
-    output_dim=nf_out,
-    num_lstm_layers=config["num_lstm_layers"]
-).to(device)
-criterion = nn.MSELoss()
-optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-
-num_epochs = 190
-patience = 60
-best_val = float("inf")
-epochs_no_improve = 0
-best_state = None
-
-for epoch in tqdm(range(num_epochs)):
-    model.train()
-    train_loss_sum = 0.0
-    n_elem_train = 0
-    for X_batch, y_batch in train_loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        output = model(X_batch)
-        loss = criterion(output, y_batch)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        batch_elems = X_batch.size(0) * nf_out
-        train_loss_sum += loss.item() * batch_elems
-        n_elem_train += batch_elems
-    train_loss = train_loss_sum / max(n_elem_train, 1)
-
-    model.eval()
-    val_loss = mse_mean_over_batches(val_loader, model, criterion, device, nf_out)
-
-    if val_loss < best_val:
-        best_val = val_loss
-        epochs_no_improve = 0
-        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-    else:
-        epochs_no_improve += 1
-
-    if epoch % 25 == 0:
-        print(
-            f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f} (best: {best_val:.4f})"
-        )
-
-    if epochs_no_improve >= patience:
-        print(f"Early stopping at epoch {epoch+1} (no val improvement for {patience} epochs).")
-        break
-
-if best_state is not None:
-    model.load_state_dict(best_state)
-
-eval_train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-y_train_pred, y_train_scaled = utils.predict_loader(model, eval_train_loader, device)
-y_test_pred, y_test_scaled = utils.predict_loader(model, test_loader, device)
+y_train_pred, y_train_scaled_out = utils.predict_loader(model, eval_train_loader, device)
+y_test_pred, y_test_scaled_out = utils.predict_loader(model, test_loader, device)
 
 y_train_preds = scaler_y.inverse_transform(y_train_pred.numpy())
-y_train_inv = scaler_y.inverse_transform(y_train_scaled.numpy())
+y_train_inv = scaler_y.inverse_transform(y_train_scaled_out.numpy())
 y_test_preds = scaler_y.inverse_transform(y_test_pred.numpy())
-y_test_inv = scaler_y.inverse_transform(y_test_scaled.numpy())
+y_test_inv = scaler_y.inverse_transform(y_test_scaled_out.numpy())
 
-# Multi-output; sklearn averages RMSE across outputs by default (see multioutput='uniform_average').
 train_rmse = root_mean_squared_error(y_train_inv, y_train_preds)
 test_rmse = root_mean_squared_error(y_test_inv, y_test_preds)
 
-# Column 0 = cumulative log return over next 1 bar (= daily log return at label day).
 _ret = 0
 train_rmse_ret = root_mean_squared_error(y_train_inv[:, _ret], y_train_preds[:, _ret])
 test_rmse_ret = root_mean_squared_error(y_test_inv[:, _ret], y_test_preds[:, _ret])
@@ -165,7 +310,6 @@ print(
 )
 print(f"Train RMSE (1-day cumulative log return): {train_rmse_ret:.6f} | Test: {test_rmse_ret:.6f}")
 
-# Permutation feature importance
 feature_importance = utils.permutation_feature_importance_mse(
     model,
     X_test_scaled,
@@ -177,17 +321,15 @@ feature_importance = utils.permutation_feature_importance_mse(
 print(feature_importance)
 utils.plot_permutation_feature_importance(feature_importance)
 
-# SHAP values for each output
 for output_index, name in enumerate(full_ds.target_column_names):
-
     print(
         f"\nOutput index: {output_index} "
         f"({name}) SHAP values"
     )
 
-    shap_values, shap_samples = utils.get_shap_values(
+    shap_values, _ = utils.get_shap_values(
         model,
-        X_train_scaled,
+        X_trainval_scaled,
         X_test_scaled,
         device,
         background_size=96,
@@ -200,10 +342,9 @@ for output_index, name in enumerate(full_ds.target_column_names):
     utils.shap_time_heatmap(
         name,
         full_ds.input_feature_names,
-        sv
+        sv,
     )
 
-# Save the model and scalers
 directory = Path(__file__).resolve().parent.parent
 model_dir = directory / "models"
 scaler_dir = directory / "scalers"

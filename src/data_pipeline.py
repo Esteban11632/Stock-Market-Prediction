@@ -293,6 +293,39 @@ class StockMarketDataset(Dataset):
         y = np.stack([self[i][1].numpy() for i in range(n)], axis=0)
         return X, y
 
+    def get_samples_info_sets(self):
+        """
+        Required for mlfinlab PurgedKFold.
+        
+        Returns
+        -------
+        pd.Series
+            index = label-bar timestamp (when the forward return window starts)
+            value = timestamp when the longest forward horizon is fully realized
+        """
+        starts = []
+        ends = []
+
+        for idx in range(len(self)):
+            base = self._warmup + idx * self.stride
+            lbl = base + self.seq_length
+
+            start_time = self.returns.index[lbl]
+
+            end_pos = (
+                base
+                + self.seq_length
+                + self._fwd_horizon_max
+                - 1
+            )
+
+            end_time = self.returns.index[end_pos]
+
+            starts.append(start_time)
+            ends.append(end_time)
+
+        return pd.Series(ends, index=starts)
+
     def __getitem__(self, idx):
         base = self._warmup + idx * self.stride
 

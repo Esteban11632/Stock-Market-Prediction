@@ -501,6 +501,20 @@ def as_numpy_all_x(ds, df):
         np.asarray(target_start_positions)
     )
 
+def mse_mean_over_batches(loader, model, criterion, device, out_dim):
+    """MSELoss(reduction='mean') is over all elements; aggregate correctly across batches."""
+    total = 0.0
+    n_elem = 0
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            loss = criterion(model(X_batch), y_batch)
+            batch_elems = X_batch.size(0) * out_dim
+            total += loss.item() * batch_elems
+            n_elem += batch_elems
+    return total / max(n_elem, 1)
+
 def plot_prediction_timeline(
     dates,
     true_prices,
