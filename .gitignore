@@ -7,6 +7,10 @@ __pycache__/
 # Scalers files
 *.joblib
 
+# Environment files
+.env*
+.env.local*
+
 # LaTeX build artifacts
 *.aux
 *.fdb_latexmk
