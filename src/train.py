@@ -91,6 +91,11 @@ def train_model_cv(
     fold_label=None,
 ):
     """Train with early stopping; used inside PurgedKFold to pick best_epoch per fold."""
+    if len(X_train) == 0 or len(X_val) == 0:
+        raise ValueError(
+            f"{fold_label or 'CV fold'} has empty train ({len(X_train)}) or val ({len(X_val)}) split. "
+            "Check chronological sorting before PurgedKFold."
+        )
     scaler_X, scaler_y = fit_scalers(X_train, y_train, nf_in)
     X_train_scaled, y_train_scaled = scale_xy(scaler_X, scaler_y, X_train, y_train, nf_in)
     X_val_scaled, y_val_scaled = scale_xy(scaler_X, scaler_y, X_val, y_val, nf_in)
@@ -146,9 +151,10 @@ def train_model_cv(
                 f"Early stopping at epoch {epoch + 1} "
                 f"(no val improvement for {patience} epochs)."
             )
+            last_epoch = epoch + 1
             break
 
-    return best_val, best_epoch
+    return best_val, last_epoch
 
 def train_model_final(
     X,
@@ -244,6 +250,12 @@ X = X[valid_mask]
 y = y[valid_mask]
 samples_info_sets = samples_info_sets.iloc[valid_mask]
 
+# Sort by label-start time so PurgedKFold splits chronologically (required for multi-ticker pools).
+sort_order = np.lexsort((np.arange(len(samples_info_sets)), samples_info_sets.index.values))
+X = X[sort_order]
+y = y[sort_order]
+samples_info_sets = samples_info_sets.iloc[sort_order]
+
 print(f"Total samples after NaN removal: {len(X):,}")
 print(f"NaNs in X: {np.isnan(X).sum()}")
 print(f"NaNs in y: {np.isnan(y).sum()}")
@@ -276,12 +288,12 @@ cv = PurgedKFold(
 )
 
 fold_scores = []
-fold_best_epochs = []
+fold_last_epochs = []
 
 for fold, (train_idx, val_idx) in enumerate(cv.split(X_trainval)):
     print(f"\n========== Fold {fold + 1} ==========")
 
-    best_val, best_epoch = train_model_cv(
+    best_val, last_epoch = train_model_cv(
         X_trainval[train_idx],
         y_trainval[train_idx],
         X_trainval[val_idx],
@@ -292,14 +304,14 @@ for fold, (train_idx, val_idx) in enumerate(cv.split(X_trainval)):
         fold_label=f"fold {fold + 1}",
     )
     fold_scores.append(best_val)
-    fold_best_epochs.append(best_epoch)
-    print(f"Fold {fold + 1} best val loss: {best_val:.6f} @ epoch {best_epoch}")
+    fold_last_epochs.append(last_epoch)
+    print(f"Fold {fold + 1} best val loss: {best_val:.6f} @ epoch {last_epoch}")
 
 print("Fold scores:", fold_scores)
 print(f"Mean CV val loss: {sum(fold_scores) / len(fold_scores):.6f}")
-print(f"Best epochs per fold: {fold_best_epochs}")
+print(f"Last epochs per fold: {fold_last_epochs}")
 
-final_epochs = max(1, round(sum(fold_best_epochs) / len(fold_best_epochs)))
+final_epochs = max(1, round(sum(fold_last_epochs) / len(fold_last_epochs)))
 print(f"Final training epochs (CV average): {final_epochs}")
 
 # ============================================================

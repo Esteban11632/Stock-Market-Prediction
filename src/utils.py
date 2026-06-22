@@ -520,6 +520,7 @@ def plot_prediction_timeline(
     true_prices,
     predicted_prices,
     target_names,
+    ticker,
     output_index=0,
     future_date=None,
     future_prediction=None
@@ -548,7 +549,7 @@ def plot_prediction_timeline(
             color="red",
             s=120,
             label="Future forecast",
-            zorder=5
+            zorder=5,
         )
 
         plt.plot(
@@ -570,7 +571,7 @@ def plot_prediction_timeline(
     plt.ylabel("Price")
 
     plt.title(
-        f"Prediction Timeline - "
+        f"Prediction Timeline - {ticker} - "
         f"{target_names[output_index]} "
         f"- RMSE: {rmse:.6f}"
     )

@@ -137,6 +137,7 @@ for index, H in enumerate(horizons):
         true_prices_h,
         predicted_prices_h,
         [full_ds.target_column_names[index]],
+        ticker,
         output_index=0,
         future_date=future_date,
         future_prediction=future_prediction
