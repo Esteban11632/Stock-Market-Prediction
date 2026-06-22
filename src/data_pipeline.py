@@ -2,6 +2,13 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+from transformers import pipeline
+import requests
+import os
+
+load_dotenv()
 
 class StockMarketDataset(Dataset):
     """Sliding windows: X stacks past inputs; targets are forward cumulative **log** returns.
@@ -18,10 +25,16 @@ class StockMarketDataset(Dataset):
     Use ``input_feature_names`` / ``target_column_names`` for labels aligned with tensor columns.
     """
 
-    def __init__(self, df, seq_length=5, stride=1):
+    def __init__(self, df, wanted_features, engineering_features,start_date, end_date=date.today().strftime("%Y-%m-%d"), seq_length=5, stride=1, ticker="VOO"):
         super().__init__()
 
+        self.pipe = pipeline("text-classification", model="ProsusAI/finbert")
+        self.headers = {"User-Agent": os.getenv("SEC_USER_AGENT")}
+
         self.stride = stride
+        self.ticker = ticker
+        self.wanted_features = wanted_features
+        self.engineering_features = engineering_features
 
         close = df["Close"].squeeze()
         if isinstance(close, pd.DataFrame):
@@ -137,7 +150,27 @@ class StockMarketDataset(Dataset):
 
         # Overnight gap: today's open minus prior session's close (aligned to returns idx).
         self.overnight_gap = (open_ - close.shift(1)).reindex(idx)
-        
+
+        # SEC data
+        self.cik = self.cik_matching_ticker(self.ticker, self.headers)
+        self.facts = self.get_facts(self.cik, self.headers)
+        self.feature_data = self.get_wanted_features(
+            self.facts,
+            self.wanted_features,
+            start_date,
+            end_date
+        )
+        self.feature_data = self.get_engineering_features(
+            self.feature_data,
+            self.wanted_features,
+            self.engineering_features
+        )
+        self.sec_daily_features = self.build_sec_daily_features(
+            self.feature_data,
+            self.engineering_features,
+            idx
+        )
+
         _x_extra_specs = (
             ("returns", self.returns),
             ("returns_open", self.returns_open),
@@ -167,6 +200,13 @@ class StockMarketDataset(Dataset):
             #("momentum_5d", self.momentum_5d),
             #("momentum_20d", self.momentum_20d),
             #("overnight_gap", self.overnight_gap),
+            ("asset_growth_yoy", self.sec_daily_features["asset_growth_yoy"]),
+            ("liability_growth_yoy", self.sec_daily_features["liability_growth_yoy"]),
+            ("cash_growth_yoy", self.sec_daily_features["cash_growth_yoy"]),
+            ("net_income_growth_yoy", self.sec_daily_features["net_income_growth_yoy"]),
+            ("eps_growth_yoy", self.sec_daily_features["eps_growth_yoy"]),
+            ("shares_growth_yoy", self.sec_daily_features["shares_growth_yoy"]),
+            ("operating_cf_growth_yoy", self.sec_daily_features["operating_cf_growth_yoy"]),
         )
         self.cols_x = [series for _, series in _x_extra_specs]
         self.input_feature_names = tuple(
@@ -325,6 +365,147 @@ class StockMarketDataset(Dataset):
             ends.append(end_time)
 
         return pd.Series(ends, index=starts)
+
+    def cik_matching_ticker(self, ticker, headers):
+        ticker = ticker.upper().replace(".", "-")
+        ticker_json = requests.get(
+            "https://www.sec.gov/files/company_tickers.json", headers=headers
+        ).json()
+
+        for company in ticker_json.values():
+            if company["ticker"] == ticker:
+                cik = str(company["cik_str"]).zfill(10)
+                return cik
+        raise ValueError(f"Ticker {ticker} not found in SEC database")
+
+    def get_facts(self, cik, headers):
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    
+    def get_wanted_features(self, facts, wanted_features, start_date, end_date):
+        start_date = pd.Timestamp(start_date) - pd.DateOffset(years=2)
+        end_date = pd.Timestamp(end_date)
+
+        feature_data = {}
+
+        for feature in wanted_features:
+
+            if feature not in facts["facts"]["us-gaap"]:
+                continue
+
+            concept = facts["facts"]["us-gaap"][feature]
+
+            units = concept["units"]
+
+            # Grab the first unit available
+            unit_name = next(iter(units))
+
+            df = pd.DataFrame(units[unit_name])
+
+            cols = [
+                c for c in [
+                    "end",
+                    "filed",
+                    "form",
+                    "val",
+                    "frame",
+                    "fy",
+                    "fp"
+                ]
+                if c in df.columns
+            ]
+
+            feature_data[feature] = df[cols]
+
+        for name, df in feature_data.items():
+            tmp = df.copy()
+            tmp["filed"] = pd.to_datetime(tmp["filed"])
+            feature_data[name] = tmp[
+                tmp["filed"].between(start_date, end_date)
+            ]
+
+        return feature_data
+
+    def get_engineering_features(self, feature_data, wanted_features, engineering_features):
+        for raw_feature, engineered_feature in zip(wanted_features, engineering_features):
+            if raw_feature not in feature_data:
+                continue
+
+            df = feature_data[raw_feature].copy()
+
+            df = df[df["form"].isin(["10-K", "10-Q"])]
+
+            df["end"] = pd.to_datetime(df["end"])
+            df["filed"] = pd.to_datetime(df["filed"])
+
+            df = df.sort_values("filed")
+
+            # keep one value per accounting period
+            df = df.groupby("end", as_index=False).last()
+
+            # sort by accounting period before pct_change
+            df = df.sort_values("end")
+
+            # YoY growth: 4 quarters back (works for quarterly 10-Q series)
+            df[engineered_feature] = df["val"].pct_change(4)
+
+            df = df.dropna(subset=[engineered_feature])
+
+            feature_data[engineered_feature] = df[
+                [
+                    "end",
+                    "filed",
+                    engineered_feature
+                ]
+            ]
+
+        return feature_data
+
+    def build_sec_daily_features(self, feature_data, engineering_features, idx):
+        sec_frames = []
+
+        for feature in engineering_features:
+            if feature not in feature_data:
+                continue
+
+            df = feature_data[feature].copy()
+            df["filed"] = pd.to_datetime(df["filed"])
+
+            df = df[["filed", feature]]
+            sec_frames.append(df)
+
+        if not sec_frames:
+            return pd.DataFrame(index=idx)
+
+        sec = sec_frames[0]
+
+        for other in sec_frames[1:]:
+            sec = pd.merge(sec, other, on="filed", how="outer")
+
+        sec = sec.sort_values("filed")
+        sec = sec.set_index("filed")
+
+        sec = sec.groupby(sec.index).last()
+
+        sec_daily = (
+            sec
+            .reindex(idx.union(sec.index))
+            .sort_index()
+            .ffill()
+            .reindex(idx)
+        )
+
+        for feature in engineering_features:
+            if feature not in sec_daily.columns:
+                sec_daily[feature] = np.nan
+
+        sec_daily = sec_daily[list(engineering_features)]
+
+        sec_daily = sec_daily.fillna(0.0)
+
+        return sec_daily
 
     def __getitem__(self, idx):
         base = self._warmup + idx * self.stride

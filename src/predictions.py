@@ -16,9 +16,11 @@ config = get_config()
 
 ticker = config["ticker"]
 seq_length = config["seq_length"]
-start_date = config["test_start_date"]
+test_start_date = config["test_start_date"]
+wanted_features = config["wanted_features"]
+engineering_features = config["engineering_features"]
 
-df = yf.download(ticker, start=start_date)
+df = yf.download(ticker, start=test_start_date)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -28,7 +30,7 @@ scaler_dir = directory / "scalers"
 
 filename = "stock_market_model.pth"
 
-full_ds = StockMarketDataset(df, seq_length)
+full_ds = StockMarketDataset(df=df, start_date=test_start_date, seq_length=seq_length, wanted_features=wanted_features, engineering_features=engineering_features, ticker=ticker)
 
 X, y, anchor_prices, target_start_positions = utils.as_numpy_all_x(full_ds, df)
 

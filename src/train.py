@@ -13,20 +13,23 @@ import utils
 from joblib import dump
 from config import get_config
 from purgeKFold import PurgedKFoldCustom as PurgedKFold
+from tickers import tickers
+import numpy as np
+import pandas as pd
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(42)
 
 config = get_config()
 
-ticker = config["ticker"]
 seq_length = config["seq_length"]
 train_start_date = config["train_start_date"]
 train_end_date = config["train_end_date"]
 batch_size = config["batch_size"]
 max_epochs = config["max_epochs"]
 patience = config["patience"]
-
+wanted_features = config["wanted_features"]
+engineering_features = config["engineering_features"]
 
 def fit_scalers(X_train, y_train, nf_in):
     scaler_X = StandardScaler()
@@ -147,7 +150,6 @@ def train_model_cv(
 
     return best_val, best_epoch
 
-
 def train_model_final(
     X,
     y,
@@ -184,21 +186,69 @@ def train_model_final(
 
     return model, X_scaled, y_scaled
 
+all_X = []
+all_y = []
+all_samples_info_sets = []
+first_ds = None
 
-df = yf.download(
-    ticker,
-    start=train_start_date,
-    end=train_end_date,
+for ticker in tickers:
+    print(f"\nBuilding dataset for {ticker}")
+
+    df = yf.download(
+        ticker,
+        start=train_start_date,
+        end=train_end_date,
+        auto_adjust=False
+    )
+
+    if df.empty:
+        print(f"Skipping {ticker}: no price data")
+        continue
+
+    ds = StockMarketDataset(
+        df=df,
+        start_date=train_start_date,
+        end_date=train_end_date,
+        seq_length=seq_length,
+        wanted_features=wanted_features,
+        engineering_features=engineering_features,
+        ticker=ticker,
+    )
+
+    X_i, y_i = ds.as_numpy()
+
+    all_X.append(X_i)
+    all_y.append(y_i)
+    all_samples_info_sets.append(ds.get_samples_info_sets())
+
+    if first_ds is None:
+        first_ds = ds
+
+X = np.concatenate(all_X, axis=0)
+y = np.concatenate(all_y, axis=0)
+
+print("NaNs in X:", np.isnan(X).sum())
+print("NaNs in y:", np.isnan(y).sum())
+print("Inf in X:", np.isinf(X).sum())
+print("Inf in y:", np.isinf(y).sum())
+
+full_ds = first_ds
+samples_info_sets = pd.concat(all_samples_info_sets, axis=0)
+
+valid_mask = (
+    np.isfinite(X).all(axis=(1, 2)) &
+    np.isfinite(y).all(axis=1)
 )
 
-full_ds = StockMarketDataset(
-    df,
-    seq_length,
-)
+X = X[valid_mask]
+y = y[valid_mask]
+samples_info_sets = samples_info_sets.iloc[valid_mask]
 
-samples_info_sets = full_ds.get_samples_info_sets()
+print(f"Total samples after NaN removal: {len(X):,}")
+print(f"NaNs in X: {np.isnan(X).sum()}")
+print(f"NaNs in y: {np.isnan(y).sum()}")
 
-X, y = full_ds.as_numpy()
+assert len(samples_info_sets) == len(X)
 
 n = len(X)
 test_size = int(0.10 * n)
